@@ -681,6 +681,56 @@ export async function listBookmarks(
   }
 }
 
+export async function getFilterSuggestions(
+  field: 'author' | 'category' | 'domain',
+  prefix: string = '',
+  limit: number = 20,
+): Promise<string[]> {
+  const columnMap = {
+    author: 'author_handle',
+    category: 'primary_category',
+    domain: 'primary_domain',
+  } as const;
+  const col = columnMap[field];
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureMigrations(db);
+
+  try {
+    let sql: string;
+    let params: Array<string | number>;
+
+    if (prefix) {
+      sql = `
+        SELECT ${col}, COUNT(*) AS cnt
+        FROM bookmarks
+        WHERE ${col} IS NOT NULL AND ${col} != ''
+          AND ${col} LIKE ? COLLATE NOCASE
+        GROUP BY ${col}
+        ORDER BY cnt DESC
+        LIMIT ?
+      `;
+      params = [`${prefix}%`, limit];
+    } else {
+      sql = `
+        SELECT ${col}, COUNT(*) AS cnt
+        FROM bookmarks
+        WHERE ${col} IS NOT NULL AND ${col} != ''
+        GROUP BY ${col}
+        ORDER BY cnt DESC
+        LIMIT ?
+      `;
+      params = [limit];
+    }
+
+    const rows = db.exec(sql, params);
+    if (!rows.length) return [];
+    return rows[0].values.map((row) => row[0] as string);
+  } finally {
+    db.close();
+  }
+}
+
 export async function countBookmarks(
   filters: BookmarkTimelineFilters = {},
 ): Promise<number> {

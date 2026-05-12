@@ -231,6 +231,110 @@ test('GET /api/bookmarks/:id returns 404 for unknown id', async () => {
     });
 });
 
+// ── /api/suggestions ──────────────────────────────────────────────────────────
+
+test('GET /api/suggestions?field=author returns array of strings', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/suggestions?field=author`);
+        assert.equal(res.status, 200);
+        assert.match(res.headers.get('content-type') ?? '', /application\/json/);
+        const data = await res.json() as unknown[];
+        assert.ok(Array.isArray(data));
+        for (const item of data) {
+            assert.equal(typeof item, 'string');
+        }
+    });
+});
+
+test('GET /api/suggestions?field=author includes alice and bob', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const data = await fetch(`${base}/api/suggestions?field=author`).then((r) => r.json()) as string[];
+        assert.ok(data.includes('alice'));
+        assert.ok(data.includes('bob'));
+    });
+});
+
+test('GET /api/suggestions?field=author orders by frequency descending', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const data = await fetch(`${base}/api/suggestions?field=author`).then((r) => r.json()) as string[];
+        // alice has 2 bookmarks, bob has 1 — alice should come first
+        assert.equal(data[0], 'alice');
+    });
+});
+
+test('GET /api/suggestions?field=author&q=ali filters to matching authors', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const data = await fetch(`${base}/api/suggestions?field=author&q=ali`).then((r) => r.json()) as string[];
+        assert.ok(data.includes('alice'));
+        assert.ok(!data.includes('bob'));
+    });
+});
+
+test('GET /api/suggestions?field=author&q=ALICE is case-insensitive', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const data = await fetch(`${base}/api/suggestions?field=author&q=ALICE`).then((r) => r.json()) as string[];
+        assert.ok(data.includes('alice'));
+    });
+});
+
+test('GET /api/suggestions?field=category returns array', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/suggestions?field=category`);
+        assert.equal(res.status, 200);
+        const data = await res.json() as unknown[];
+        assert.ok(Array.isArray(data));
+    });
+});
+
+test('GET /api/suggestions?field=domain returns array', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/suggestions?field=domain`);
+        assert.equal(res.status, 200);
+        const data = await res.json() as unknown[];
+        assert.ok(Array.isArray(data));
+    });
+});
+
+test('GET /api/suggestions?field=invalid returns 400', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/suggestions?field=invalid`);
+        assert.equal(res.status, 400);
+    });
+});
+
+test('GET /api/suggestions with no field returns 400', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/suggestions`);
+        assert.equal(res.status, 400);
+    });
+});
+
+// ── HTML autocomplete ─────────────────────────────────────────────────────────
+
+test('GET / HTML includes datalist-style autocomplete attributes for author', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const body = await fetch(`${base}/`).then((r) => r.text());
+        assert.match(body, /fetchSuggestions\('author'/);
+        assert.match(body, /autocomplete\.author/);
+    });
+});
+
+test('GET / HTML includes datalist-style autocomplete attributes for category', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const body = await fetch(`${base}/`).then((r) => r.text());
+        assert.match(body, /fetchSuggestions\('category'/);
+        assert.match(body, /autocomplete\.category/);
+    });
+});
+
+test('GET / HTML includes datalist-style autocomplete attributes for domain', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const body = await fetch(`${base}/`).then((r) => r.text());
+        assert.match(body, /fetchSuggestions\('domain'/);
+        assert.match(body, /autocomplete\.domain/);
+    });
+});
+
 // ── Error handling ────────────────────────────────────────────────────────────
 
 test('POST / returns 405 method not allowed', async () => {

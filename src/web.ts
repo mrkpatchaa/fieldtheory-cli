@@ -6,6 +6,7 @@ import {
   listBookmarks,
   countBookmarks,
   getBookmarkById,
+  getFilterSuggestions,
 } from './bookmarks-db.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -294,15 +295,61 @@ function buildHtml(): string {
         <input x-model="filters.q" @input.debounce.300ms="searchBookmarks()"
           placeholder="Search bookmarks…"
           class="flex-1 min-w-[200px] bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
-        <input x-model="filters.author" @input.debounce.300ms="searchBookmarks()"
-          placeholder="Author handle…"
-          class="w-40 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
-        <input x-model="filters.category" @input.debounce.300ms="searchBookmarks()"
-          placeholder="Category…"
-          class="w-36 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
-        <input x-model="filters.domain" @input.debounce.300ms="searchBookmarks()"
-          placeholder="Domain…"
-          class="w-36 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
+
+        <!-- Author autocomplete -->
+        <div class="relative">
+          <input x-model="filters.author"
+            @input.debounce.300ms="searchBookmarks(); fetchSuggestions('author', filters.author)"
+            @focus="fetchSuggestions('author', filters.author)"
+            @blur.debounce.150ms="autocomplete.author.open = false"
+            placeholder="Author handle…"
+            class="w-40 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
+          <div x-show="autocomplete.author.open"
+            class="absolute z-50 top-full mt-1 w-full min-w-[160px] bg-[#1a1a2e] border border-white/10 rounded-lg shadow-xl overflow-auto max-h-40">
+            <template x-for="s in autocomplete.author.items" :key="s">
+              <button @mousedown.prevent="selectSuggestion('author', s)"
+                class="block w-full text-left px-3 py-1.5 text-sm text-white/70 hover:bg-white/10 hover:text-white transition-colors"
+                x-text="s"></button>
+            </template>
+          </div>
+        </div>
+
+        <!-- Category autocomplete -->
+        <div class="relative">
+          <input x-model="filters.category"
+            @input.debounce.300ms="searchBookmarks(); fetchSuggestions('category', filters.category)"
+            @focus="fetchSuggestions('category', filters.category)"
+            @blur.debounce.150ms="autocomplete.category.open = false"
+            placeholder="Category…"
+            class="w-36 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
+          <div x-show="autocomplete.category.open"
+            class="absolute z-50 top-full mt-1 w-full min-w-[144px] bg-[#1a1a2e] border border-white/10 rounded-lg shadow-xl overflow-auto max-h-40">
+            <template x-for="s in autocomplete.category.items" :key="s">
+              <button @mousedown.prevent="selectSuggestion('category', s)"
+                class="block w-full text-left px-3 py-1.5 text-sm text-white/70 hover:bg-white/10 hover:text-white transition-colors"
+                x-text="s"></button>
+            </template>
+          </div>
+        </div>
+
+        <!-- Domain autocomplete -->
+        <div class="relative">
+          <input x-model="filters.domain"
+            @input.debounce.300ms="searchBookmarks(); fetchSuggestions('domain', filters.domain)"
+            @focus="fetchSuggestions('domain', filters.domain)"
+            @blur.debounce.150ms="autocomplete.domain.open = false"
+            placeholder="Domain…"
+            class="w-36 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
+          <div x-show="autocomplete.domain.open"
+            class="absolute z-50 top-full mt-1 w-full min-w-[144px] bg-[#1a1a2e] border border-white/10 rounded-lg shadow-xl overflow-auto max-h-40">
+            <template x-for="s in autocomplete.domain.items" :key="s">
+              <button @mousedown.prevent="selectSuggestion('domain', s)"
+                class="block w-full text-left px-3 py-1.5 text-sm text-white/70 hover:bg-white/10 hover:text-white transition-colors"
+                x-text="s"></button>
+            </template>
+          </div>
+        </div>
+
         <select x-model="filters.sort" @change="searchBookmarks()"
           class="bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:ring-1 focus:ring-purple-500">
           <option value="desc">Newest first</option>
@@ -755,6 +802,11 @@ function app() {
       limit: 50,
       offset: 0,
     },
+    autocomplete: {
+      author:   { open: false, items: [] },
+      category: { open: false, items: [] },
+      domain:   { open: false, items: [] },
+    },
     chartsBuilt: false,
 
     async init() {
@@ -824,7 +876,29 @@ function app() {
 
     clearFilters() {
       Object.assign(this.filters, { q: '', author: '', category: '', domain: '', after: '', before: '', sort: 'desc', offset: 0 });
+      this.autocomplete.author.open = false;
+      this.autocomplete.category.open = false;
+      this.autocomplete.domain.open = false;
       this.loadBookmarks();
+    },
+
+    async fetchSuggestions(field, value) {
+      if (!value) {
+        this.autocomplete[field].open = false;
+        return;
+      }
+      try {
+        const res = await fetch('/api/suggestions?field=' + field + '&q=' + encodeURIComponent(value));
+        const items = await res.json();
+        this.autocomplete[field].items = items;
+        this.autocomplete[field].open = items.length > 0;
+      } catch { /* silent */ }
+    },
+
+    selectSuggestion(field, value) {
+      this.filters[field] = value;
+      this.autocomplete[field].open = false;
+      this.searchBookmarks();
     },
 
     prevPage() {
@@ -878,6 +952,20 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   if (pathname === '/api/overview') {
     const data = await buildVizData();
     json(res, data);
+    return;
+  }
+
+  // /api/suggestions
+  if (pathname === '/api/suggestions') {
+    const q = qs(req);
+    const field = q.field;
+    if (field !== 'author' && field !== 'category' && field !== 'domain') {
+      json(res, { error: 'field must be author, category, or domain' }, 400);
+      return;
+    }
+    const prefix = q.q ?? '';
+    const suggestions = await getFilterSuggestions(field, prefix);
+    json(res, suggestions);
     return;
   }
 
