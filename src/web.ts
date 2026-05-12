@@ -1,6 +1,8 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
+import { readFile } from 'node:fs/promises';
 import { parse as parseUrl } from 'node:url';
 import { spawn } from 'node:child_process';
+import path from 'node:path';
 import { buildVizData } from './bookmarks-viz.js';
 import {
   listBookmarks,
@@ -8,6 +10,46 @@ import {
   getBookmarkById,
   getFilterSuggestions,
 } from './bookmarks-db.js';
+import { pathExists, readJson } from './fs.js';
+import { bookmarkMediaDir, bookmarkMediaManifestPath } from './paths.js';
+import type { MediaFetchManifest } from './bookmark-media.js';
+
+// ── Media index ───────────────────────────────────────────────────────────────
+
+interface MediaEntry { filename: string; contentType: string; isProfileImage: boolean }
+type MediaIndex = Map<string, MediaEntry[]>; // tweetId → entries
+
+const EXT_CONTENT_TYPE: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.mp4': 'video/mp4',
+};
+
+async function buildMediaIndex(): Promise<MediaIndex> {
+  const manifestPath = bookmarkMediaManifestPath();
+  if (!(await pathExists(manifestPath))) return new Map();
+  try {
+    const manifest = await readJson<MediaFetchManifest>(manifestPath);
+    const index = new Map<string, MediaEntry[]>();
+    for (const entry of manifest.entries) {
+      if (entry.status !== 'downloaded' || !entry.localPath) continue;
+      const filename = path.basename(entry.localPath);
+      const arr = index.get(entry.tweetId) ?? [];
+      arr.push({
+        filename,
+        contentType: entry.contentType ?? 'application/octet-stream',
+        isProfileImage: entry.sourceUrl.includes('/profile_images/'),
+      });
+      index.set(entry.tweetId, arr);
+    }
+    return index;
+  } catch {
+    return new Map();
+  }
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -474,9 +516,22 @@ function buildHtml(): string {
                 <div class="ml-auto flex items-center gap-3 text-white/30 text-xs">
                   <span x-show="b.likeCount > 0" x-text="'♥ ' + b.likeCount.toLocaleString()"></span>
                   <span x-show="b.repostCount > 0" x-text="'↺ ' + b.repostCount.toLocaleString()"></span>
-                  <span x-show="b.mediaCount > 0" x-text="'📎 ' + b.mediaCount"></span>
+                  <span x-show="b.mediaCount > 0 && (!b.localMediaUrls || b.localMediaUrls.length === 0)" x-text="'📎 ' + b.mediaCount"></span>
                 </div>
               </div>
+
+              <!-- Thumbnail strip (only when local files exist) -->
+              <template x-if="b.localMediaUrls && b.localMediaUrls.length > 0">
+                <div class="mt-2 flex gap-1.5">
+                  <template x-for="url in b.localMediaUrls.slice(0, 4)" :key="url">
+                    <img :src="url" class="h-16 w-16 object-cover rounded-md bg-white/5 shrink-0"
+                      @error="$el.style.display='none'" />
+                  </template>
+                  <span x-show="b.localMediaUrls.length > 4"
+                    class="flex items-center px-2 text-xs text-white/40"
+                    x-text="'+' + (b.localMediaUrls.length - 4) + ' more'"></span>
+                </div>
+              </template>
             </div>
           </div>
         </article>
@@ -521,11 +576,11 @@ function buildHtml(): string {
 
             <!-- Author -->
             <div class="flex items-center gap-3">
-              <img :src="detail.authorProfileImageUrl || ''" :alt="detail.authorHandle"
-                x-show="detail.authorProfileImageUrl"
+              <img :src="detail.localProfileImageUrl || detail.authorProfileImageUrl || ''" :alt="detail.authorHandle"
+                x-show="detail.localProfileImageUrl || detail.authorProfileImageUrl"
                 class="w-12 h-12 rounded-full bg-white/10"
-                @error="$el.style.display='none'" />
-              <div x-show="!detail.authorProfileImageUrl"
+                @error="$el.src = detail.authorProfileImageUrl || ''" />
+              <div x-show="!detail.localProfileImageUrl && !detail.authorProfileImageUrl"
                 class="w-12 h-12 rounded-full bg-purple-900/50 flex items-center justify-center text-purple-300 text-lg font-bold"
                 x-text="(detail.authorHandle || '?')[0].toUpperCase()"></div>
               <div>
@@ -537,7 +592,20 @@ function buildHtml(): string {
             <!-- Full text -->
             <p class="text-white/90 text-sm leading-relaxed whitespace-pre-wrap" x-text="detail.text"></p>
 
-            <!-- Dates -->
+            <!-- Media gallery -->
+            <template x-if="detail.localMediaUrls && detail.localMediaUrls.length > 0">
+              <div>
+                <div class="text-white/40 text-xs uppercase tracking-wider mb-2">Media</div>
+                <div class="grid grid-cols-2 gap-2">
+                  <template x-for="url in detail.localMediaUrls" :key="url">
+                    <a :href="url" target="_blank" rel="noopener" class="block rounded-lg overflow-hidden bg-white/5">
+                      <img :src="url" class="w-full object-cover max-h-52"
+                        @error="$el.closest('a').style.display='none'" />
+                    </a>
+                  </template>
+                </div>
+              </div>
+            </template>
             <div class="flex gap-4 text-xs text-white/40 border-t border-white/5 pt-4">
               <span x-show="detail.postedAt" x-text="'Posted: ' + (detail.postedAt || '').slice(0,10)"></span>
               <span x-show="detail.bookmarkedAt" x-text="'Bookmarked: ' + (detail.bookmarkedAt || '').slice(0,10)"></span>
@@ -986,7 +1054,7 @@ function app() {
 
 // ── Request router ────────────────────────────────────────────────────────────
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaIndex: MediaIndex): Promise<void> {
   const parsed = parseUrl(req.url ?? '', true);
   const pathname = parsed.pathname ?? '/';
 
@@ -998,6 +1066,33 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   if (req.method !== 'GET') {
     json(res, { error: 'method not allowed' }, 405);
+    return;
+  }
+
+  // /media/:filename — serve locally cached media files
+  const mediaFileMatch = pathname.match(/^\/media\/([^/]+)$/);
+  if (mediaFileMatch) {
+    const filename = mediaFileMatch[1];
+    const mediaDir = bookmarkMediaDir();
+    const resolved = path.resolve(mediaDir, filename);
+    // Security: reject path traversal — resolved path must stay inside mediaDir
+    if (!resolved.startsWith(mediaDir + path.sep) && resolved !== mediaDir) {
+      json(res, { error: 'invalid filename' }, 400);
+      return;
+    }
+    try {
+      const buf = await readFile(resolved);
+      const ext = path.extname(filename).toLowerCase();
+      const contentType = EXT_CONTENT_TYPE[ext] ?? 'application/octet-stream';
+      res.writeHead(200, {
+        'Content-Type': contentType,
+        'Content-Length': buf.length,
+        'Cache-Control': 'public, max-age=86400',
+      });
+      res.end(buf);
+    } catch {
+      json(res, { error: 'not found' }, 404);
+    }
     return;
   }
 
@@ -1046,7 +1141,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       json(res, { error: 'not found' }, 404);
       return;
     }
-    json(res, bookmark);
+    const mediaEntries = mediaIndex.get(bookmark.tweetId) ?? [];
+    const localMediaUrls = mediaEntries
+      .filter((e) => !e.isProfileImage)
+      .map((e) => `/media/${e.filename}`);
+    const localProfileImageUrl = mediaEntries.find((e) => e.isProfileImage)
+      ? `/media/${mediaEntries.find((e) => e.isProfileImage)!.filename}`
+      : undefined;
+    json(res, { ...bookmark, localMediaUrls, localProfileImageUrl });
     return;
   }
 
@@ -1064,7 +1166,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       limit: q.limit ? Math.min(200, Math.max(1, parseInt(q.limit, 10))) : 50,
       offset: q.offset ? Math.max(0, parseInt(q.offset, 10)) : 0,
     });
-    json(res, items);
+    const enriched = items.map((b) => {
+      const entries = mediaIndex.get(b.tweetId) ?? [];
+      const localMediaUrls = entries
+        .filter((e) => !e.isProfileImage)
+        .map((e) => `/media/${e.filename}`);
+      return { ...b, localMediaUrls };
+    });
+    json(res, enriched);
     return;
   }
 
@@ -1074,9 +1183,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 // ── Server factory (exported for testing) ────────────────────────────────────
 
 export async function createWebServer(port: number): Promise<{ port: number; close: () => Promise<void> }> {
+  const mediaIndex = await buildMediaIndex();
   const server = createServer(async (req, res) => {
     try {
-      await handleRequest(req, res);
+      await handleRequest(req, res, mediaIndex);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       json(res, { error: message }, 500);

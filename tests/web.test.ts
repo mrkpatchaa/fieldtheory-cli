@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -358,5 +358,140 @@ test('GET /api/unknown returns 404', async () => {
     await withWebServer(FIXTURES, async (base) => {
         const res = await fetch(`${base}/api/unknown`);
         assert.equal(res.status, 404);
+    });
+});
+
+// ── /media/:filename ─────────────────────────────────────────────────────────
+
+test('GET /media/nonexistent.jpg returns 404 when no media downloaded', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/media/nonexistent.jpg`);
+        assert.equal(res.status, 404);
+    });
+});
+
+test('GET /media/:filename serves a downloaded file from local disk', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ft-web-media-test-'));
+    const jsonl = FIXTURES.map((r) => JSON.stringify(r)).join('\n') + '\n';
+    await writeFile(path.join(dir, 'bookmarks.jsonl'), jsonl);
+    const mediaDir = path.join(dir, 'media');
+    await mkdir(mediaDir, { recursive: true });
+    const fakeBytes = Buffer.from('fake-image-bytes');
+    await writeFile(path.join(mediaDir, 'abc123def456.jpg'), fakeBytes);
+    const manifest = {
+        schemaVersion: 1,
+        generatedAt: new Date().toISOString(),
+        limit: 100, maxBytes: 200 * 1024 * 1024,
+        processed: 1, downloaded: 1, skippedTooLarge: 0, failed: 0,
+        entries: [{
+            bookmarkId: '3', tweetId: '3',
+            tweetUrl: 'https://x.com/alice/status/3',
+            authorHandle: 'alice',
+            sourceUrl: 'https://img.example.com/1.jpg',
+            localPath: path.join(mediaDir, 'abc123def456.jpg'),
+            contentType: 'image/jpeg',
+            bytes: fakeBytes.length,
+            status: 'downloaded',
+            fetchedAt: new Date().toISOString(),
+        }],
+    };
+    await writeFile(path.join(dir, 'media-manifest.json'), JSON.stringify(manifest));
+    const savedDir = process.env.FT_DATA_DIR;
+    process.env.FT_DATA_DIR = dir;
+    let close: (() => Promise<void>) | undefined;
+    try {
+        await buildIndex({ force: true });
+        const server = await createWebServer(0);
+        close = server.close;
+        const base = `http://127.0.0.1:${server.port}`;
+        const res = await fetch(`${base}/media/abc123def456.jpg`);
+        assert.equal(res.status, 200);
+        assert.match(res.headers.get('content-type') ?? '', /image\/jpeg/);
+        const body = Buffer.from(await res.arrayBuffer());
+        assert.equal(body.toString(), 'fake-image-bytes');
+    } finally {
+        await close?.();
+        if (savedDir !== undefined) process.env.FT_DATA_DIR = savedDir;
+        else delete process.env.FT_DATA_DIR;
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// ── localMediaUrls in API responses ──────────────────────────────────────────
+
+test('GET /api/bookmarks/:id includes localMediaUrls field', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/bookmarks/3`);
+        assert.equal(res.status, 200);
+        const data = await res.json() as Record<string, unknown>;
+        assert.ok(Array.isArray(data.localMediaUrls), 'localMediaUrls should be an array');
+    });
+});
+
+test('GET /api/bookmarks list includes localMediaUrls per item', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const items = await fetch(`${base}/api/bookmarks`).then((r) => r.json()) as Record<string, unknown>[];
+        assert.ok(Array.isArray(items));
+        for (const item of items) {
+            assert.ok(Array.isArray(item.localMediaUrls), 'each item should have localMediaUrls array');
+        }
+    });
+});
+
+test('GET /api/bookmarks/:id localMediaUrls map to /media/ paths', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ft-web-media2-test-'));
+    const jsonl = FIXTURES.map((r) => JSON.stringify(r)).join('\n') + '\n';
+    await writeFile(path.join(dir, 'bookmarks.jsonl'), jsonl);
+    const mediaDir = path.join(dir, 'media');
+    await mkdir(mediaDir, { recursive: true });
+    const fakeBytes = Buffer.from('img');
+    await writeFile(path.join(mediaDir, '3-deadbeef.jpg'), fakeBytes);
+    const manifest = {
+        schemaVersion: 1, generatedAt: new Date().toISOString(),
+        limit: 100, maxBytes: 200 * 1024 * 1024,
+        processed: 1, downloaded: 1, skippedTooLarge: 0, failed: 0,
+        entries: [{
+            bookmarkId: '3', tweetId: '3',
+            tweetUrl: 'https://x.com/alice/status/3',
+            authorHandle: 'alice',
+            sourceUrl: 'https://img.example.com/1.jpg',
+            localPath: path.join(mediaDir, '3-deadbeef.jpg'),
+            contentType: 'image/jpeg', bytes: 3,
+            status: 'downloaded', fetchedAt: new Date().toISOString(),
+        }],
+    };
+    await writeFile(path.join(dir, 'media-manifest.json'), JSON.stringify(manifest));
+    const savedDir = process.env.FT_DATA_DIR;
+    process.env.FT_DATA_DIR = dir;
+    let close: (() => Promise<void>) | undefined;
+    try {
+        await buildIndex({ force: true });
+        const server = await createWebServer(0);
+        close = server.close;
+        const base = `http://127.0.0.1:${server.port}`;
+        const data = await fetch(`${base}/api/bookmarks/3`).then((r) => r.json()) as Record<string, unknown>;
+        const urls = data.localMediaUrls as string[];
+        assert.ok(urls.includes('/media/3-deadbeef.jpg'));
+    } finally {
+        await close?.();
+        if (savedDir !== undefined) process.env.FT_DATA_DIR = savedDir;
+        else delete process.env.FT_DATA_DIR;
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// ── HTML media UI ─────────────────────────────────────────────────────────────
+
+test('GET / HTML includes media gallery in detail panel', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const body = await fetch(`${base}/`).then((r) => r.text());
+        assert.match(body, /detail\.localMediaUrls/);
+    });
+});
+
+test('GET / HTML includes media thumbnail strip in bookmark cards', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const body = await fetch(`${base}/`).then((r) => r.text());
+        assert.match(body, /b\.localMediaUrls/);
     });
 });
