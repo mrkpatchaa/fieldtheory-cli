@@ -309,29 +309,32 @@ test('GET /api/suggestions with no field returns 400', async () => {
     });
 });
 
-// ── HTML autocomplete ─────────────────────────────────────────────────────────
+// ── HTML searchable dropdowns ─────────────────────────────────────────────────
 
-test('GET / HTML includes datalist-style autocomplete attributes for author', async () => {
+test('GET / HTML includes searchable dropdown for author', async () => {
     await withWebServer(FIXTURES, async (base) => {
         const body = await fetch(`${base}/`).then((r) => r.text());
         assert.match(body, /fetchSuggestions\('author'/);
         assert.match(body, /autocomplete\.author/);
+        assert.match(body, /toggleDropdown\('author'\)/);
     });
 });
 
-test('GET / HTML includes datalist-style autocomplete attributes for category', async () => {
+test('GET / HTML includes searchable dropdown for category', async () => {
     await withWebServer(FIXTURES, async (base) => {
         const body = await fetch(`${base}/`).then((r) => r.text());
         assert.match(body, /fetchSuggestions\('category'/);
         assert.match(body, /autocomplete\.category/);
+        assert.match(body, /toggleDropdown\('category'\)/);
     });
 });
 
-test('GET / HTML includes datalist-style autocomplete attributes for domain', async () => {
+test('GET / HTML includes searchable dropdown for domain', async () => {
     await withWebServer(FIXTURES, async (base) => {
         const body = await fetch(`${base}/`).then((r) => r.text());
         assert.match(body, /fetchSuggestions\('domain'/);
         assert.match(body, /autocomplete\.domain/);
+        assert.match(body, /toggleDropdown\('domain'\)/);
     });
 });
 

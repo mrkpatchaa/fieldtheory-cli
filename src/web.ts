@@ -296,57 +296,96 @@ function buildHtml(): string {
           placeholder="Search bookmarks…"
           class="flex-1 min-w-[200px] bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
 
-        <!-- Author autocomplete -->
-        <div class="relative">
-          <input x-model="filters.author"
-            @input.debounce.300ms="searchBookmarks(); fetchSuggestions('author', filters.author)"
-            @focus="fetchSuggestions('author', filters.author)"
-            @blur.debounce.150ms="autocomplete.author.open = false"
-            placeholder="Author handle…"
-            class="w-40 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
-          <div x-show="autocomplete.author.open"
-            class="absolute z-50 top-full mt-1 w-full min-w-[160px] bg-[#1a1a2e] border border-white/10 rounded-lg shadow-xl overflow-auto max-h-40">
-            <template x-for="s in autocomplete.author.items" :key="s">
-              <button @mousedown.prevent="selectSuggestion('author', s)"
-                class="block w-full text-left px-3 py-1.5 text-sm text-white/70 hover:bg-white/10 hover:text-white transition-colors"
-                x-text="s"></button>
-            </template>
+        <!-- Author searchable dropdown -->
+        <div class="relative" @click.outside="autocomplete.author.open = false">
+          <button @click="toggleDropdown('author')"
+            :class="filters.author ? 'border-purple-500/50 text-white' : 'text-white/40'"
+            class="flex items-center gap-2 w-40 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm hover:border-white/20 focus:outline-none focus:ring-1 focus:ring-purple-500 transition-colors">
+            <span class="flex-1 text-left truncate" x-text="filters.author || 'Author…'"></span>
+            <svg class="w-3 h-3 shrink-0 opacity-40" :class="autocomplete.author.open && 'rotate-180'" style="transition:transform .15s" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+          </button>
+          <div x-show="autocomplete.author.open" x-transition
+            class="absolute z-50 top-full mt-1 w-52 bg-[#1a1a2e] border border-white/10 rounded-lg shadow-xl">
+            <div class="p-2 border-b border-white/5">
+              <input x-ref="authorSearch" x-model="autocomplete.author.search"
+                @input.debounce.200ms="fetchSuggestions('author', autocomplete.author.search)"
+                placeholder="Search author…"
+                class="w-full bg-white/5 border border-white/10 rounded px-2 py-1.5 text-xs text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
+            </div>
+            <div class="overflow-auto max-h-48 py-1">
+              <button x-show="filters.author" @click="selectSuggestion('author', '')"
+                class="block w-full text-left px-3 py-1.5 text-xs text-white/40 hover:bg-white/10 hover:text-white/70 italic transition-colors">Clear selection</button>
+              <template x-for="s in autocomplete.author.items" :key="s">
+                <button @click="selectSuggestion('author', s)"
+                  :class="s === filters.author ? 'bg-purple-900/40 text-purple-300' : 'text-white/70 hover:bg-white/10 hover:text-white'"
+                  class="block w-full text-left px-3 py-1.5 text-sm transition-colors"
+                  x-text="s"></button>
+              </template>
+              <div x-show="autocomplete.author.items.length === 0"
+                class="px-3 py-3 text-xs text-white/30 text-center">No results</div>
+            </div>
           </div>
         </div>
 
-        <!-- Category autocomplete -->
-        <div class="relative">
-          <input x-model="filters.category"
-            @input.debounce.300ms="searchBookmarks(); fetchSuggestions('category', filters.category)"
-            @focus="fetchSuggestions('category', filters.category)"
-            @blur.debounce.150ms="autocomplete.category.open = false"
-            placeholder="Category…"
-            class="w-36 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
-          <div x-show="autocomplete.category.open"
-            class="absolute z-50 top-full mt-1 w-full min-w-[144px] bg-[#1a1a2e] border border-white/10 rounded-lg shadow-xl overflow-auto max-h-40">
-            <template x-for="s in autocomplete.category.items" :key="s">
-              <button @mousedown.prevent="selectSuggestion('category', s)"
-                class="block w-full text-left px-3 py-1.5 text-sm text-white/70 hover:bg-white/10 hover:text-white transition-colors"
-                x-text="s"></button>
-            </template>
+        <!-- Category searchable dropdown -->
+        <div class="relative" @click.outside="autocomplete.category.open = false">
+          <button @click="toggleDropdown('category')"
+            :class="filters.category ? 'border-purple-500/50 text-white' : 'text-white/40'"
+            class="flex items-center gap-2 w-36 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm hover:border-white/20 focus:outline-none focus:ring-1 focus:ring-purple-500 transition-colors">
+            <span class="flex-1 text-left truncate" x-text="filters.category || 'Category…'"></span>
+            <svg class="w-3 h-3 shrink-0 opacity-40" :class="autocomplete.category.open && 'rotate-180'" style="transition:transform .15s" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+          </button>
+          <div x-show="autocomplete.category.open" x-transition
+            class="absolute z-50 top-full mt-1 w-52 bg-[#1a1a2e] border border-white/10 rounded-lg shadow-xl">
+            <div class="p-2 border-b border-white/5">
+              <input x-ref="categorySearch" x-model="autocomplete.category.search"
+                @input.debounce.200ms="fetchSuggestions('category', autocomplete.category.search)"
+                placeholder="Search category…"
+                class="w-full bg-white/5 border border-white/10 rounded px-2 py-1.5 text-xs text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
+            </div>
+            <div class="overflow-auto max-h-48 py-1">
+              <button x-show="filters.category" @click="selectSuggestion('category', '')"
+                class="block w-full text-left px-3 py-1.5 text-xs text-white/40 hover:bg-white/10 hover:text-white/70 italic transition-colors">Clear selection</button>
+              <template x-for="s in autocomplete.category.items" :key="s">
+                <button @click="selectSuggestion('category', s)"
+                  :class="s === filters.category ? 'bg-purple-900/40 text-purple-300' : 'text-white/70 hover:bg-white/10 hover:text-white'"
+                  class="block w-full text-left px-3 py-1.5 text-sm transition-colors"
+                  x-text="s"></button>
+              </template>
+              <div x-show="autocomplete.category.items.length === 0"
+                class="px-3 py-3 text-xs text-white/30 text-center">No results</div>
+            </div>
           </div>
         </div>
 
-        <!-- Domain autocomplete -->
-        <div class="relative">
-          <input x-model="filters.domain"
-            @input.debounce.300ms="searchBookmarks(); fetchSuggestions('domain', filters.domain)"
-            @focus="fetchSuggestions('domain', filters.domain)"
-            @blur.debounce.150ms="autocomplete.domain.open = false"
-            placeholder="Domain…"
-            class="w-36 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
-          <div x-show="autocomplete.domain.open"
-            class="absolute z-50 top-full mt-1 w-full min-w-[144px] bg-[#1a1a2e] border border-white/10 rounded-lg shadow-xl overflow-auto max-h-40">
-            <template x-for="s in autocomplete.domain.items" :key="s">
-              <button @mousedown.prevent="selectSuggestion('domain', s)"
-                class="block w-full text-left px-3 py-1.5 text-sm text-white/70 hover:bg-white/10 hover:text-white transition-colors"
-                x-text="s"></button>
-            </template>
+        <!-- Domain searchable dropdown -->
+        <div class="relative" @click.outside="autocomplete.domain.open = false">
+          <button @click="toggleDropdown('domain')"
+            :class="filters.domain ? 'border-purple-500/50 text-white' : 'text-white/40'"
+            class="flex items-center gap-2 w-36 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm hover:border-white/20 focus:outline-none focus:ring-1 focus:ring-purple-500 transition-colors">
+            <span class="flex-1 text-left truncate" x-text="filters.domain || 'Domain…'"></span>
+            <svg class="w-3 h-3 shrink-0 opacity-40" :class="autocomplete.domain.open && 'rotate-180'" style="transition:transform .15s" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+          </button>
+          <div x-show="autocomplete.domain.open" x-transition
+            class="absolute z-50 top-full mt-1 w-52 bg-[#1a1a2e] border border-white/10 rounded-lg shadow-xl">
+            <div class="p-2 border-b border-white/5">
+              <input x-ref="domainSearch" x-model="autocomplete.domain.search"
+                @input.debounce.200ms="fetchSuggestions('domain', autocomplete.domain.search)"
+                placeholder="Search domain…"
+                class="w-full bg-white/5 border border-white/10 rounded px-2 py-1.5 text-xs text-white placeholder-white/30 focus:outline-none focus:ring-1 focus:ring-purple-500" />
+            </div>
+            <div class="overflow-auto max-h-48 py-1">
+              <button x-show="filters.domain" @click="selectSuggestion('domain', '')"
+                class="block w-full text-left px-3 py-1.5 text-xs text-white/40 hover:bg-white/10 hover:text-white/70 italic transition-colors">Clear selection</button>
+              <template x-for="s in autocomplete.domain.items" :key="s">
+                <button @click="selectSuggestion('domain', s)"
+                  :class="s === filters.domain ? 'bg-purple-900/40 text-purple-300' : 'text-white/70 hover:bg-white/10 hover:text-white'"
+                  class="block w-full text-left px-3 py-1.5 text-sm transition-colors"
+                  x-text="s"></button>
+              </template>
+              <div x-show="autocomplete.domain.items.length === 0"
+                class="px-3 py-3 text-xs text-white/30 text-center">No results</div>
+            </div>
           </div>
         </div>
 
@@ -803,9 +842,9 @@ function app() {
       offset: 0,
     },
     autocomplete: {
-      author:   { open: false, items: [] },
-      category: { open: false, items: [] },
-      domain:   { open: false, items: [] },
+      author:   { open: false, search: '', items: [] },
+      category: { open: false, search: '', items: [] },
+      domain:   { open: false, search: '', items: [] },
     },
     chartsBuilt: false,
 
@@ -876,22 +915,36 @@ function app() {
 
     clearFilters() {
       Object.assign(this.filters, { q: '', author: '', category: '', domain: '', after: '', before: '', sort: 'desc', offset: 0 });
-      this.autocomplete.author.open = false;
-      this.autocomplete.category.open = false;
-      this.autocomplete.domain.open = false;
+      for (const f of ['author', 'category', 'domain']) {
+        Object.assign(this.autocomplete[f], { open: false, search: '', items: [] });
+      }
       this.loadBookmarks();
     },
 
-    async fetchSuggestions(field, value) {
-      if (!value) {
-        this.autocomplete[field].open = false;
-        return;
+    async toggleDropdown(field) {
+      const isOpen = this.autocomplete[field].open;
+      // Close all others first
+      for (const f of ['author', 'category', 'domain']) {
+        this.autocomplete[f].open = false;
       }
+      if (!isOpen) {
+        this.autocomplete[field].open = true;
+        await this.fetchSuggestions(field, this.autocomplete[field].search);
+        // Focus the search input after opening
+        this.$nextTick(() => {
+          const ref = this.$refs[field + 'Search'];
+          if (ref) ref.focus();
+        });
+      }
+    },
+
+    async fetchSuggestions(field, value) {
       try {
-        const res = await fetch('/api/suggestions?field=' + field + '&q=' + encodeURIComponent(value));
-        const items = await res.json();
-        this.autocomplete[field].items = items;
-        this.autocomplete[field].open = items.length > 0;
+        const url = value
+          ? '/api/suggestions?field=' + field + '&q=' + encodeURIComponent(value)
+          : '/api/suggestions?field=' + field;
+        const res = await fetch(url);
+        this.autocomplete[field].items = await res.json();
       } catch { /* silent */ }
     },
 
