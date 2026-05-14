@@ -58,10 +58,10 @@ test('buildIndex refreshes existing rows without dropping classifications', asyn
     const updatedFixtures = FIXTURES.map((fixture) =>
       fixture.id === '1'
         ? {
-            ...fixture,
-            text: 'Machine learning note updated',
-            bookmarkedAt: '2026-04-02T00:00:00Z',
-          }
+          ...fixture,
+          text: 'Machine learning note updated',
+          bookmarkedAt: '2026-04-02T00:00:00Z',
+        }
         : fixture
     );
     const jsonl = updatedFixtures.map((r) => JSON.stringify(r)).join('\n') + '\n';
