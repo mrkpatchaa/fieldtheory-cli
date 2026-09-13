@@ -84,8 +84,8 @@ test('GET / returns HTML shell', async () => {
         const body = await res.text();
         assert.match(body, /<!DOCTYPE html>/i);
         assert.match(body, /Field Theory/);
-        assert.match(body, /alpinejs/);
-        assert.match(body, /chart\.js/);
+        assert.match(body, /\/assets\/alpine\.min\.js/);
+        assert.match(body, /\/assets\/chart\.umd\.min\.js/);
     });
 });
 
@@ -358,6 +358,69 @@ test('GET /api/unknown returns 404', async () => {
     await withWebServer(FIXTURES, async (base) => {
         const res = await fetch(`${base}/api/unknown`);
         assert.equal(res.status, 404);
+    });
+});
+
+// ── Hardening & performance ──────────────────────────────────────────────────
+
+test('API responses do not allow cross-origin reads', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/bookmarks`, { headers: { Origin: 'https://evil.example' } });
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get('access-control-allow-origin'), null);
+    });
+});
+
+test('GET /api/bookmarks reports the total match count in X-Total-Count', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/bookmarks?author=alice&limit=1`);
+        const items = await res.json() as unknown[];
+        assert.equal(items.length, 1);
+        assert.equal(res.headers.get('x-total-count'), '2');
+    });
+});
+
+test('GET /api/bookmarks ignores non-numeric limit and offset', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/bookmarks?limit=abc&offset=xyz`);
+        assert.equal(res.status, 200);
+        const items = await res.json() as unknown[];
+        assert.equal(items.length, 3);
+    });
+});
+
+test('GET / loads bundled assets instead of CDNs, and the assets are served', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const body = await (await fetch(`${base}/`)).text();
+        assert.doesNotMatch(body, /cdn\.tailwindcss\.com|cdn\.jsdelivr\.net/);
+        for (const [asset, type] of [
+            ['/assets/app.css', 'text/css'],
+            ['/assets/chart.umd.min.js', 'text/javascript'],
+            ['/assets/alpine.min.js', 'text/javascript'],
+        ]) {
+            const res = await fetch(`${base}${asset}`);
+            assert.equal(res.status, 200, asset);
+            assert.match(res.headers.get('content-type') ?? '', new RegExp(type));
+            assert.ok((await res.text()).length > 1000, `${asset} should not be empty`);
+        }
+    });
+});
+
+test('DELETE /api/bookmarks/:id removes the bookmark from list, detail, and search', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        // Warm the cached index first so the delete must invalidate it.
+        assert.equal((await (await fetch(`${base}/api/bookmarks?q=learning`)).json() as unknown[]).length, 2);
+
+        const del = await fetch(`${base}/api/bookmarks/1`, { method: 'DELETE' });
+        assert.equal(del.status, 200);
+
+        const search = await (await fetch(`${base}/api/bookmarks?q=learning`)).json() as Array<{ id: string }>;
+        assert.deepEqual(search.map((b) => b.id), ['3']);
+        assert.equal((await fetch(`${base}/api/bookmarks/1`)).status, 404);
+        const all = await fetch(`${base}/api/bookmarks`);
+        assert.equal(all.headers.get('x-total-count'), '2');
+        // The remaining rows are still searchable after the targeted FTS delete.
+        assert.equal((await (await fetch(`${base}/api/bookmarks?q=rust`)).json() as unknown[]).length, 1);
     });
 });
 

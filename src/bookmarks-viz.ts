@@ -1,3 +1,4 @@
+import type { Database } from 'sql.js';
 import { openDb } from './db.js';
 import { parseTimestampMs, toIsoDate, toIsoMonth, toMonthDayLabel, toUtcHour, toWeekdayShort, toYearLabel } from './date-utils.js';
 import { twitterBookmarksIndexPath } from './paths.js';
@@ -270,8 +271,9 @@ function aggregateTimelineData(rows: TimelineAggregateRow[]): {
   };
 }
 
-export async function buildVizData(): Promise<VizData> {
-  const db = await openDb(twitterBookmarksIndexPath());
+/** Pass `existingDb` to reuse an open index (the caller keeps ownership). */
+export async function buildVizData(existingDb?: Database): Promise<VizData> {
+  const db = existingDb ?? await openDb(twitterBookmarksIndexPath());
 
   try {
     const total = db.exec('SELECT COUNT(*) FROM bookmarks')[0]?.values[0]?.[0] as number;
@@ -423,7 +425,7 @@ export async function buildVizData(): Promise<VizData> {
       domains,
     };
   } finally {
-    db.close();
+    if (!existingDb) db.close();
   }
 }
 

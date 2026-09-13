@@ -1,8 +1,10 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { parse as parseUrl } from 'node:url';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import type { Database } from 'sql.js';
 import { buildVizData } from './bookmarks-viz.js';
 import {
   listBookmarks,
@@ -10,10 +12,89 @@ import {
   getBookmarkById,
   getFilterSuggestions,
   deleteBookmark,
+  ensureMigrations,
 } from './bookmarks-db.js';
+import { openDb } from './db.js';
 import { pathExists, readJson } from './fs.js';
-import { bookmarkMediaDir, bookmarkMediaManifestPath } from './paths.js';
+import { bookmarkMediaDir, bookmarkMediaManifestPath, twitterBookmarksIndexPath } from './paths.js';
 import type { MediaFetchManifest } from './bookmark-media.js';
+import { WEB_CSS } from './web-styles.js';
+
+// ── File-backed caches ────────────────────────────────────────────────────────
+
+async function fileVersion(filePath: string): Promise<string | null> {
+  try {
+    const s = await stat(filePath);
+    return `${s.mtimeMs}:${s.size}`;
+  } catch {
+    return null;
+  }
+}
+
+/** How long a replaced value stays usable by requests already holding it. */
+const DISPOSE_DELAY_MS = 5_000;
+
+/**
+ * Keep one loaded copy of a file-backed value and reload it only when the file
+ * changes on disk (a sync, classify, media fetch, or a delete from this server).
+ * Loading the WASM SQLite index costs a full file read, so doing it once per
+ * change instead of once per request keeps search responsive.
+ */
+function cachedByFile<T>(
+  getPath: () => string,
+  load: () => Promise<T>,
+  dispose?: (value: T) => void,
+): { get: () => Promise<T>; dispose: () => void } {
+  let cached: { version: string | null; value: Promise<T> } | undefined;
+
+  const get = async (): Promise<T> => {
+    const version = await fileVersion(getPath());
+    if (!cached || cached.version !== version) {
+      const previous = cached;
+      const entry = { version, value: load() };
+      cached = entry;
+      // Never cache a failed load.
+      entry.value.catch(() => { if (cached === entry) cached = undefined; });
+      if (previous && dispose) {
+        previous.value.then(
+          (value) => { setTimeout(() => dispose(value), DISPOSE_DELAY_MS).unref(); },
+          () => { /* nothing to dispose */ },
+        );
+      }
+    }
+    return cached.value;
+  };
+
+  return {
+    get,
+    dispose: () => {
+      if (cached && dispose) cached.value.then(dispose, () => { /* nothing to dispose */ });
+      cached = undefined;
+    },
+  };
+}
+
+async function loadIndexDb(): Promise<Database> {
+  const db = await openDb(twitterBookmarksIndexPath());
+  ensureMigrations(db);
+  return db;
+}
+
+// ── Static assets ─────────────────────────────────────────────────────────────
+
+const requireFromHere = createRequire(import.meta.url);
+
+/** Vendored front-end libraries, served from node_modules so the dashboard works offline. */
+const VENDOR_ASSETS: Record<string, { resolve: () => string; contentType: string }> = {
+  '/assets/chart.umd.min.js': {
+    resolve: () => path.join(path.dirname(requireFromHere.resolve('chart.js')), 'chart.umd.min.js'),
+    contentType: 'text/javascript; charset=utf-8',
+  },
+  '/assets/alpine.min.js': {
+    resolve: () => path.join(path.dirname(requireFromHere.resolve('alpinejs')), 'cdn.min.js'),
+    contentType: 'text/javascript; charset=utf-8',
+  },
+};
 
 // ── Media index ───────────────────────────────────────────────────────────────
 
@@ -54,14 +135,22 @@ async function buildMediaIndex(): Promise<MediaIndex> {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function json(res: ServerResponse, data: unknown, status = 200): void {
+// No CORS headers on purpose: the dashboard is same-origin, and allowing any
+// origin would let every website open in the browser read the local archive.
+function json(res: ServerResponse, data: unknown, status = 200, headers: Record<string, string> = {}): void {
   const body = JSON.stringify(data);
   res.writeHead(status, {
+    ...headers,
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(body),
-    'Access-Control-Allow-Origin': '*',
   });
   res.end(body);
+}
+
+/** Parse an integer query param, clamped to [min, max]; bad input uses the fallback. */
+function intParam(value: string | undefined, fallback: number, min: number, max = Number.MAX_SAFE_INTEGER): number {
+  const n = Number.parseInt(value ?? '', 10);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
 }
 
 function html(res: ServerResponse, body: string): void {
@@ -97,9 +186,9 @@ function buildHtml(): string {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Field Theory · Bookmark Observatory</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <link rel="stylesheet" href="/assets/app.css" />
+  <script src="/assets/chart.umd.min.js"></script>
+  <script defer src="/assets/alpine.min.js"></script>
   <style>
     [x-cloak] { display: none !important; }
     body { background: #0f0f14; color: #ccd0da; font-family: 'Inter', system-ui, sans-serif; }
@@ -111,7 +200,7 @@ function buildHtml(): string {
     .chart-container-sm { position: relative; height: 180px; }
   </style>
 </head>
-<body x-data="app()" x-init="init()" x-cloak>
+<body x-data="app()" x-cloak>
 
   <!-- Nav -->
   <nav class="sticky top-0 z-50 bg-[#0f0f14]/90 backdrop-blur border-b border-white/5">
@@ -515,8 +604,8 @@ function buildHtml(): string {
                   class="px-2 py-0.5 bg-teal-900/40 text-teal-300 text-xs rounded-full"
                   x-text="b.primaryDomain"></span>
                 <div class="ml-auto flex items-center gap-3 text-white/30 text-xs">
-                  <span x-show="b.likeCount > 0" x-text="'♥ ' + b.likeCount.toLocaleString()"></span>
-                  <span x-show="b.repostCount > 0" x-text="'↺ ' + b.repostCount.toLocaleString()"></span>
+                  <span x-show="b.likeCount > 0" x-text="'♥ ' + (b.likeCount ?? 0).toLocaleString()"></span>
+                  <span x-show="b.repostCount > 0" x-text="'↺ ' + (b.repostCount ?? 0).toLocaleString()"></span>
                   <span x-show="b.mediaCount > 0 && (!b.localMediaUrls || b.localMediaUrls.length === 0)" x-text="'📎 ' + b.mediaCount"></span>
                 </div>
               </div>
@@ -628,27 +717,27 @@ function buildHtml(): string {
             <!-- Engagement -->
             <div class="grid grid-cols-3 gap-3">
               <div x-show="detail.likeCount > 0" class="bg-white/5 rounded-lg p-3 text-center">
-                <div class="text-pink-300 font-bold" x-text="detail.likeCount.toLocaleString()"></div>
+                <div class="text-pink-300 font-bold" x-text="(detail.likeCount ?? 0).toLocaleString()"></div>
                 <div class="text-white/40 text-xs">likes</div>
               </div>
               <div x-show="detail.repostCount > 0" class="bg-white/5 rounded-lg p-3 text-center">
-                <div class="text-green-300 font-bold" x-text="detail.repostCount.toLocaleString()"></div>
+                <div class="text-green-300 font-bold" x-text="(detail.repostCount ?? 0).toLocaleString()"></div>
                 <div class="text-white/40 text-xs">reposts</div>
               </div>
               <div x-show="detail.replyCount > 0" class="bg-white/5 rounded-lg p-3 text-center">
-                <div class="text-blue-300 font-bold" x-text="detail.replyCount.toLocaleString()"></div>
+                <div class="text-blue-300 font-bold" x-text="(detail.replyCount ?? 0).toLocaleString()"></div>
                 <div class="text-white/40 text-xs">replies</div>
               </div>
               <div x-show="detail.quoteCount > 0" class="bg-white/5 rounded-lg p-3 text-center">
-                <div class="text-purple-300 font-bold" x-text="detail.quoteCount.toLocaleString()"></div>
+                <div class="text-purple-300 font-bold" x-text="(detail.quoteCount ?? 0).toLocaleString()"></div>
                 <div class="text-white/40 text-xs">quotes</div>
               </div>
               <div x-show="detail.bookmarkCount > 0" class="bg-white/5 rounded-lg p-3 text-center">
-                <div class="text-amber-300 font-bold" x-text="detail.bookmarkCount.toLocaleString()"></div>
+                <div class="text-amber-300 font-bold" x-text="(detail.bookmarkCount ?? 0).toLocaleString()"></div>
                 <div class="text-white/40 text-xs">bookmarks</div>
               </div>
               <div x-show="detail.viewCount > 0" class="bg-white/5 rounded-lg p-3 text-center">
-                <div class="text-white/60 font-bold" x-text="detail.viewCount.toLocaleString()"></div>
+                <div class="text-white/60 font-bold" x-text="(detail.viewCount ?? 0).toLocaleString()"></div>
                 <div class="text-white/40 text-xs">views</div>
               </div>
             </div>
@@ -954,14 +1043,11 @@ function app() {
     async loadBookmarks() {
       this.bookmarksLoading = true;
       try {
-        const params = this.buildParams();
-        const [listRes, countRes] = await Promise.all([
-          fetch('/api/bookmarks?' + params),
-          fetch('/api/count?' + params),
-        ]);
-        this.bookmarks = await listRes.json();
-        const countData = await countRes.json();
-        this.totalCount = countData.count ?? 0;
+        const res = await fetch('/api/bookmarks?' + this.buildParams());
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || res.statusText);
+        this.bookmarks = data;
+        this.totalCount = Number(res.headers.get('X-Total-Count')) || 0;
       } catch (e) {
         console.error('Failed to load bookmarks:', e);
       } finally {
@@ -1075,13 +1161,49 @@ function app() {
 
 // ── Request router ────────────────────────────────────────────────────────────
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaIndex: MediaIndex): Promise<void> {
+interface WebState {
+  getDb: () => Promise<Database>;
+  getMediaIndex: () => Promise<MediaIndex>;
+}
+
+function filtersFromQuery(q: Record<string, string>) {
+  return {
+    query: q.q || undefined,
+    author: q.author || undefined,
+    category: q.category || undefined,
+    domain: q.domain || undefined,
+    after: q.after || undefined,
+    before: q.before || undefined,
+  };
+}
+
+function sendAsset(res: ServerResponse, body: string | Buffer, contentType: string): void {
+  res.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'public, max-age=3600',
+  });
+  res.end(body);
+}
+
+async function handleRequest(req: IncomingMessage, res: ServerResponse, state: WebState): Promise<void> {
   const parsed = parseUrl(req.url ?? '', true);
   const pathname = parsed.pathname ?? '/';
 
   // Static HTML shell
   if (req.method === 'GET' && pathname === '/') {
     html(res, buildHtml());
+    return;
+  }
+
+  // Bundled CSS and vendored scripts
+  if (req.method === 'GET' && pathname === '/assets/app.css') {
+    sendAsset(res, WEB_CSS, 'text/css; charset=utf-8');
+    return;
+  }
+  const vendorAsset = req.method === 'GET' ? VENDOR_ASSETS[pathname] : undefined;
+  if (vendorAsset) {
+    sendAsset(res, await readFile(vendorAsset.resolve()), vendorAsset.contentType);
     return;
   }
 
@@ -1136,7 +1258,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaInd
 
   // /api/overview
   if (pathname === '/api/overview') {
-    const data = await buildVizData();
+    const data = await buildVizData(await state.getDb());
     json(res, data);
     return;
   }
@@ -1150,22 +1272,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaInd
       return;
     }
     const prefix = q.q ?? '';
-    const suggestions = await getFilterSuggestions(field, prefix);
+    const suggestions = await getFilterSuggestions(field, prefix, 20, await state.getDb());
     json(res, suggestions);
     return;
   }
 
   // /api/count
   if (pathname === '/api/count') {
-    const q = qs(req);
-    const count = await countBookmarks({
-      query: q.q || undefined,
-      author: q.author || undefined,
-      category: q.category || undefined,
-      domain: q.domain || undefined,
-      after: q.after || undefined,
-      before: q.before || undefined,
-    });
+    const count = await countBookmarks(filtersFromQuery(qs(req)), await state.getDb());
     json(res, { count });
     return;
   }
@@ -1174,36 +1288,35 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaInd
   const detailMatch = pathname.match(/^\/api\/bookmarks\/(.+)$/);
   if (detailMatch) {
     const id = decodeURIComponent(detailMatch[1]);
-    const bookmark = await getBookmarkById(id);
+    const bookmark = await getBookmarkById(id, await state.getDb());
     if (!bookmark) {
       json(res, { error: 'not found' }, 404);
       return;
     }
-    const mediaEntries = mediaIndex.get(bookmark.tweetId) ?? [];
+    const mediaEntries = (await state.getMediaIndex()).get(bookmark.tweetId) ?? [];
     const localMediaUrls = mediaEntries
       .filter((e) => !e.isProfileImage)
       .map((e) => `/media/${e.filename}`);
-    const localProfileImageUrl = mediaEntries.find((e) => e.isProfileImage)
-      ? `/media/${mediaEntries.find((e) => e.isProfileImage)!.filename}`
-      : undefined;
+    const profileImage = mediaEntries.find((e) => e.isProfileImage);
+    const localProfileImageUrl = profileImage ? `/media/${profileImage.filename}` : undefined;
     json(res, { ...bookmark, localMediaUrls, localProfileImageUrl });
     return;
   }
 
-  // /api/bookmarks
+  // /api/bookmarks — the total match count rides along in X-Total-Count so the
+  // dashboard needs one request per search instead of two.
   if (pathname === '/api/bookmarks') {
     const q = qs(req);
+    const filters = filtersFromQuery(q);
+    const db = await state.getDb();
+    const mediaIndex = await state.getMediaIndex();
     const items = await listBookmarks({
-      query: q.q || undefined,
-      author: q.author || undefined,
-      category: q.category || undefined,
-      domain: q.domain || undefined,
-      after: q.after || undefined,
-      before: q.before || undefined,
+      ...filters,
       sort: q.sort === 'asc' ? 'asc' : 'desc',
-      limit: q.limit ? Math.min(200, Math.max(1, parseInt(q.limit, 10))) : 50,
-      offset: q.offset ? Math.max(0, parseInt(q.offset, 10)) : 0,
-    });
+      limit: intParam(q.limit, 50, 1, 200),
+      offset: intParam(q.offset, 0, 0),
+    }, db);
+    const total = await countBookmarks(filters, db);
     const enriched = items.map((b) => {
       const entries = mediaIndex.get(b.tweetId) ?? [];
       const localMediaUrls = entries
@@ -1211,7 +1324,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaInd
         .map((e) => `/media/${e.filename}`);
       return { ...b, localMediaUrls };
     });
-    json(res, enriched);
+    json(res, enriched, 200, { 'X-Total-Count': String(total) });
     return;
   }
 
@@ -1221,10 +1334,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaInd
 // ── Server factory (exported for testing) ────────────────────────────────────
 
 export async function createWebServer(port: number): Promise<{ port: number; close: () => Promise<void> }> {
-  const mediaIndex = await buildMediaIndex();
+  const dbCache = cachedByFile(twitterBookmarksIndexPath, loadIndexDb, (db) => db.close());
+  const mediaCache = cachedByFile(bookmarkMediaManifestPath, buildMediaIndex);
+  const state: WebState = { getDb: dbCache.get, getMediaIndex: mediaCache.get };
+
   const server = createServer(async (req, res) => {
     try {
-      await handleRequest(req, res, mediaIndex);
+      await handleRequest(req, res, state);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       json(res, { error: message }, 500);
@@ -1239,7 +1355,12 @@ export async function createWebServer(port: number): Promise<{ port: number; clo
   const addr = server.address();
   const actualPort = typeof addr === 'object' && addr !== null ? addr.port : port;
   const close = (): Promise<void> =>
-    new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    new Promise((resolve, reject) => server.close((err) => {
+      dbCache.dispose();
+      mediaCache.dispose();
+      if (err) reject(err);
+      else resolve();
+    }));
 
   return { port: actualPort, close };
 }

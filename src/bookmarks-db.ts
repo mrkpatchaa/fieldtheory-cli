@@ -320,7 +320,7 @@ function ftsHasColumn(db: Database, column: string): boolean {
   }
 }
 
-function ensureMigrations(db: Database): void {
+export function ensureMigrations(db: Database): void {
   // Ensure meta table exists (may not on a fresh/empty DB)
   db.run('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)');
 
@@ -622,12 +622,19 @@ export async function searchBookmarks(options: SearchOptions): Promise<SearchRes
   }
 }
 
+/** Open the index for a single read, or reuse a caller-owned handle. */
+async function openForRead(existingDb?: Database): Promise<Database> {
+  if (existingDb) return existingDb;
+  const db = await openDb(twitterBookmarksIndexPath());
+  ensureMigrations(db);
+  return db;
+}
+
 export async function listBookmarks(
   filters: BookmarkTimelineFilters = {},
+  existingDb?: Database,
 ): Promise<BookmarkTimelineItem[]> {
-  const dbPath = twitterBookmarksIndexPath();
-  const db = await openDb(dbPath);
-  ensureMigrations(db);
+  const db = await openForRead(existingDb);
   const limit = filters.limit ?? 30;
   const offset = filters.offset ?? 0;
 
@@ -679,7 +686,7 @@ export async function listBookmarks(
     if (!rows.length) return [];
     return rows[0].values.map((row) => mapTimelineRow(row));
   } finally {
-    db.close();
+    if (!existingDb) db.close();
   }
 }
 
@@ -687,6 +694,7 @@ export async function getFilterSuggestions(
   field: 'author' | 'category' | 'domain',
   prefix: string = '',
   limit: number = 20,
+  existingDb?: Database,
 ): Promise<string[]> {
   const columnMap = {
     author: 'author_handle',
@@ -694,9 +702,7 @@ export async function getFilterSuggestions(
     domain: 'primary_domain',
   } as const;
   const col = columnMap[field];
-  const dbPath = twitterBookmarksIndexPath();
-  const db = await openDb(dbPath);
-  ensureMigrations(db);
+  const db = await openForRead(existingDb);
 
   try {
     let sql: string;
@@ -729,16 +735,15 @@ export async function getFilterSuggestions(
     if (!rows.length) return [];
     return rows[0].values.map((row) => row[0] as string);
   } finally {
-    db.close();
+    if (!existingDb) db.close();
   }
 }
 
 export async function countBookmarks(
   filters: BookmarkTimelineFilters = {},
+  existingDb?: Database,
 ): Promise<number> {
-  const dbPath = twitterBookmarksIndexPath();
-  const db = await openDb(dbPath);
-  ensureMigrations(db);
+  const db = await openForRead(existingDb);
 
   try {
     const { where, params } = buildBookmarkWhereClause(filters);
@@ -750,7 +755,7 @@ export async function countBookmarks(
     const rows = db.exec(sql, params);
     return Number(rows[0]?.values?.[0]?.[0] ?? 0);
   } finally {
-    db.close();
+    if (!existingDb) db.close();
   }
 }
 
@@ -825,10 +830,8 @@ export async function exportBookmarksForSyncSeed(): Promise<BookmarkRecord[]> {
   }
 }
 
-export async function getBookmarkById(id: string): Promise<BookmarkTimelineItem | null> {
-  const dbPath = twitterBookmarksIndexPath();
-  const db = await openDb(dbPath);
-  ensureMigrations(db);
+export async function getBookmarkById(id: string, existingDb?: Database): Promise<BookmarkTimelineItem | null> {
+  const db = await openForRead(existingDb);
 
   try {
     const rows = db.exec(
@@ -873,7 +876,7 @@ export async function getBookmarkById(id: string): Promise<BookmarkTimelineItem 
     const row = rows[0]?.values?.[0];
     return row ? mapTimelineRow(row) : null;
   } finally {
-    db.close();
+    if (!existingDb) db.close();
   }
 }
 
@@ -895,9 +898,15 @@ export async function deleteBookmark(id: string): Promise<{ url: string } | null
     url = (rows[0]?.values?.[0]?.[0] as string) ?? null;
     if (!url) return null;
 
+    // bookmarks_fts is an external-content table with no triggers, so remove
+    // this row's index entry explicitly (with its indexed values) before the
+    // row itself goes away. Cheaper than a full 'rebuild' on every delete.
+    db.run(
+      `INSERT INTO bookmarks_fts(bookmarks_fts, rowid, text, author_handle, author_name, article_text)
+       SELECT 'delete', rowid, text, author_handle, author_name, article_text FROM bookmarks WHERE id = ?`,
+      [id],
+    );
     db.run('DELETE FROM bookmarks WHERE id = ?', [id]);
-    // FTS5 content table is auto-updated via triggers set up in initSchema
-    db.run(`INSERT INTO bookmarks_fts(bookmarks_fts) VALUES('rebuild')`);
     saveDb(db, dbPath);
   } finally {
     db.close();
