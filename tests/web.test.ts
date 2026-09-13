@@ -2,10 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { rmSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { buildIndex } from '../src/bookmarks-db.js';
 import { createWebServer } from '../src/web.js';
+import type { WebServerOptions } from '../src/web.js';
+import type { UnbookmarkResult } from '../src/x-unbookmark.js';
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -49,9 +52,13 @@ const FIXTURES = [
 
 // ── Test helper ───────────────────────────────────────────────────────────────
 
+/** Default X stub so tests never read real browser cookies or call X. */
+const unbookmarkOk = async (): Promise<UnbookmarkResult> => ({ ok: true, status: 'removed', message: 'Removed' });
+
 async function withWebServer(
     records: unknown[],
     fn: (baseUrl: string) => Promise<void>,
+    options: WebServerOptions = { unbookmark: unbookmarkOk },
 ): Promise<void> {
     const dir = await mkdtemp(path.join(tmpdir(), 'ft-web-test-'));
     const jsonl = records.map((r) => JSON.stringify(r)).join('\n') + '\n';
@@ -63,7 +70,7 @@ async function withWebServer(
     let close: (() => Promise<void>) | undefined;
     try {
         await buildIndex({ force: true });
-        const server = await createWebServer(0); // port 0 = OS picks a free port
+        const server = await createWebServer(0, options); // port 0 = OS picks a free port
         close = server.close;
         await fn(`http://127.0.0.1:${server.port}`);
     } finally {
@@ -84,8 +91,8 @@ test('GET / returns HTML shell', async () => {
         const body = await res.text();
         assert.match(body, /<!DOCTYPE html>/i);
         assert.match(body, /Field Theory/);
-        assert.match(body, /alpinejs/);
-        assert.match(body, /chart\.js/);
+        assert.match(body, /\/assets\/alpine\.min\.js/);
+        assert.match(body, /\/assets\/chart\.umd\.min\.js/);
     });
 });
 
@@ -361,6 +368,155 @@ test('GET /api/unknown returns 404', async () => {
     });
 });
 
+// ── Hardening & performance ──────────────────────────────────────────────────
+
+test('API responses do not allow cross-origin reads', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/bookmarks`, { headers: { Origin: 'https://evil.example' } });
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get('access-control-allow-origin'), null);
+    });
+});
+
+test('GET /api/bookmarks reports the total match count in X-Total-Count', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/bookmarks?author=alice&limit=1`);
+        const items = await res.json() as unknown[];
+        assert.equal(items.length, 1);
+        assert.equal(res.headers.get('x-total-count'), '2');
+    });
+});
+
+test('GET /api/bookmarks ignores non-numeric limit and offset', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/bookmarks?limit=abc&offset=xyz`);
+        assert.equal(res.status, 200);
+        const items = await res.json() as unknown[];
+        assert.equal(items.length, 3);
+    });
+});
+
+test('GET / loads bundled assets instead of CDNs, and the assets are served', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        const body = await (await fetch(`${base}/`)).text();
+        assert.doesNotMatch(body, /cdn\.tailwindcss\.com|cdn\.jsdelivr\.net/);
+        for (const [asset, type] of [
+            ['/assets/app.css', 'text/css'],
+            ['/assets/chart.umd.min.js', 'text/javascript'],
+            ['/assets/alpine.min.js', 'text/javascript'],
+        ]) {
+            const res = await fetch(`${base}${asset}`);
+            assert.equal(res.status, 200, asset);
+            assert.match(res.headers.get('content-type') ?? '', new RegExp(type));
+            assert.ok((await res.text()).length > 1000, `${asset} should not be empty`);
+        }
+    });
+});
+
+test('DELETE /api/bookmarks/:id removes the bookmark from list, detail, and search', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        // Warm the cached index first so the delete must invalidate it.
+        assert.equal((await (await fetch(`${base}/api/bookmarks?q=learning`)).json() as unknown[]).length, 2);
+
+        const del = await fetch(`${base}/api/bookmarks/1`, { method: 'DELETE' });
+        assert.equal(del.status, 200);
+
+        const search = await (await fetch(`${base}/api/bookmarks?q=learning`)).json() as Array<{ id: string }>;
+        assert.deepEqual(search.map((b) => b.id), ['3']);
+        assert.equal((await fetch(`${base}/api/bookmarks/1`)).status, 404);
+        const all = await fetch(`${base}/api/bookmarks`);
+        assert.equal(all.headers.get('x-total-count'), '2');
+        // The remaining rows are still searchable after the targeted FTS delete.
+        assert.equal((await (await fetch(`${base}/api/bookmarks?q=rust`)).json() as unknown[]).length, 1);
+    });
+});
+
+// ── Removing bookmarks on X ──────────────────────────────────────────────────
+
+/** Raw request so Host/Origin headers can be set (fetch treats them as forbidden). */
+function rawRequest(baseUrl: string, method: string, pathname: string, headers: Record<string, string>): Promise<number> {
+    const { hostname, port } = new URL(baseUrl);
+    return new Promise((resolve, reject) => {
+        const req = httpRequest({ hostname, port, method, path: pathname, headers }, (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode ?? 0));
+        });
+        req.on('error', reject);
+        req.end();
+    });
+}
+
+test('DELETE /api/bookmarks/:id removes the bookmark on X before the local archive', async () => {
+    const calls: string[] = [];
+    const unbookmark = async (tweetId: string): Promise<UnbookmarkResult> => {
+        calls.push(tweetId);
+        return { ok: true, status: 'removed', message: 'Removed' };
+    };
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/bookmarks/2`, { method: 'DELETE' });
+        assert.equal(res.status, 200);
+        const body = await res.json() as { deleted: boolean; remote: string };
+        assert.deepEqual({ deleted: body.deleted, remote: body.remote }, { deleted: true, remote: 'removed' });
+        assert.deepEqual(calls, ['2']);
+        assert.equal((await fetch(`${base}/api/bookmarks/2`)).status, 404);
+    }, { unbookmark });
+});
+
+test('DELETE /api/bookmarks/:id keeps the local copy and explains why when X fails', async () => {
+    const unbookmark = async (): Promise<UnbookmarkResult> => ({
+        ok: false, status: 'auth', message: 'X did not accept your browser session.',
+    });
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/bookmarks/2`, { method: 'DELETE' });
+        assert.equal(res.status, 502);
+        const body = await res.json() as { error: string; reason: string; url: string };
+        assert.equal(body.reason, 'auth');
+        assert.match(body.error, /browser session/);
+        assert.equal(body.url, 'https://x.com/bob/status/2');
+        assert.equal((await fetch(`${base}/api/bookmarks/2`)).status, 200);
+    }, { unbookmark });
+});
+
+test('DELETE /api/bookmarks/:id?scope=local skips X', async () => {
+    let called = false;
+    const unbookmark = async (): Promise<UnbookmarkResult> => {
+        called = true;
+        return { ok: false, status: 'network', message: 'should not be called' };
+    };
+    await withWebServer(FIXTURES, async (base) => {
+        const res = await fetch(`${base}/api/bookmarks/2?scope=local`, { method: 'DELETE' });
+        assert.equal(res.status, 200);
+        assert.equal((await res.json() as { remote: string }).remote, 'skipped');
+        assert.equal(called, false);
+        assert.equal((await fetch(`${base}/api/bookmarks/2`)).status, 404);
+    }, { unbookmark });
+});
+
+test('requests for a non-local Host are refused (DNS rebinding)', async () => {
+    await withWebServer(FIXTURES, async (base) => {
+        assert.equal(await rawRequest(base, 'GET', '/api/bookmarks', { Host: 'attacker.example' }), 403);
+        assert.equal(await rawRequest(base, 'DELETE', '/api/bookmarks/1', { Host: 'attacker.example' }), 403);
+        assert.equal((await fetch(`${base}/api/bookmarks/1`)).status, 200);
+    });
+});
+
+test('cross-origin DELETE is refused and nothing is removed', async () => {
+    let called = false;
+    const unbookmark = async (): Promise<UnbookmarkResult> => {
+        called = true;
+        return { ok: true, status: 'removed', message: 'Removed' };
+    };
+    await withWebServer(FIXTURES, async (base) => {
+        const status = await rawRequest(base, 'DELETE', '/api/bookmarks/1', {
+            Host: new URL(base).host,
+            Origin: 'https://attacker.example',
+        });
+        assert.equal(status, 403);
+        assert.equal(called, false);
+        assert.equal((await fetch(`${base}/api/bookmarks/1`)).status, 200);
+    }, { unbookmark });
+});
+
 // ── /media/:filename ─────────────────────────────────────────────────────────
 
 test('GET /media/nonexistent.jpg returns 404 when no media downloaded', async () => {
@@ -532,9 +688,12 @@ test('DELETE /api/bookmarks/:id returns 404 for unknown id', async () => {
     });
 });
 
-test('GET / HTML includes deleteBookmark function', async () => {
+test('GET / HTML includes the remove-bookmark flow with its fallback dialog', async () => {
     await withWebServer(FIXTURES, async (base) => {
         const body = await fetch(`${base}/`).then((r) => r.text());
-        assert.match(body, /deleteBookmark/);
+        assert.match(body, /removeBookmark\(detail\)/);
+        assert.match(body, /role="dialog"/);
+        assert.match(body, /Open on X to unbookmark it yourself/);
+        assert.doesNotMatch(body, /window\.open\(/);
     });
 });

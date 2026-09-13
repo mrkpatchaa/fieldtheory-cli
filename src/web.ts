@@ -1,8 +1,10 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { parse as parseUrl } from 'node:url';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import type { Database } from 'sql.js';
 import { buildVizData } from './bookmarks-viz.js';
 import {
   listBookmarks,
@@ -10,10 +12,107 @@ import {
   getBookmarkById,
   getFilterSuggestions,
   deleteBookmark,
+  ensureMigrations,
 } from './bookmarks-db.js';
+import { openDb } from './db.js';
 import { pathExists, readJson } from './fs.js';
-import { bookmarkMediaDir, bookmarkMediaManifestPath } from './paths.js';
+import { bookmarkMediaDir, bookmarkMediaManifestPath, twitterBookmarksIndexPath } from './paths.js';
 import type { MediaFetchManifest } from './bookmark-media.js';
+import { WEB_CSS } from './web-styles.js';
+import { createUnbookmarker } from './x-unbookmark.js';
+import type { UnbookmarkResult, UnbookmarkStatus } from './x-unbookmark.js';
+import type { XSessionOptions } from './graphql-bookmarks.js';
+
+// ── Request origin checks ─────────────────────────────────────────────────────
+
+const LOCAL_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
+
+/** Browsers send Origin on cross-site mutations; refuse any that isn't this server. */
+function isSameOrigin(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === req.headers.host;
+  } catch {
+    return false;
+  }
+}
+
+// ── File-backed caches ────────────────────────────────────────────────────────
+
+async function fileVersion(filePath: string): Promise<string | null> {
+  try {
+    const s = await stat(filePath);
+    return `${s.mtimeMs}:${s.size}`;
+  } catch {
+    return null;
+  }
+}
+
+/** How long a replaced value stays usable by requests already holding it. */
+const DISPOSE_DELAY_MS = 5_000;
+
+/**
+ * Keep one loaded copy of a file-backed value and reload it only when the file
+ * changes on disk (a sync, classify, media fetch, or a delete from this server).
+ * Loading the WASM SQLite index costs a full file read, so doing it once per
+ * change instead of once per request keeps search responsive.
+ */
+function cachedByFile<T>(
+  getPath: () => string,
+  load: () => Promise<T>,
+  dispose?: (value: T) => void,
+): { get: () => Promise<T>; dispose: () => void } {
+  let cached: { version: string | null; value: Promise<T> } | undefined;
+
+  const get = async (): Promise<T> => {
+    const version = await fileVersion(getPath());
+    if (!cached || cached.version !== version) {
+      const previous = cached;
+      const entry = { version, value: load() };
+      cached = entry;
+      // Never cache a failed load.
+      entry.value.catch(() => { if (cached === entry) cached = undefined; });
+      if (previous && dispose) {
+        previous.value.then(
+          (value) => { setTimeout(() => dispose(value), DISPOSE_DELAY_MS).unref(); },
+          () => { /* nothing to dispose */ },
+        );
+      }
+    }
+    return cached.value;
+  };
+
+  return {
+    get,
+    dispose: () => {
+      if (cached && dispose) cached.value.then(dispose, () => { /* nothing to dispose */ });
+      cached = undefined;
+    },
+  };
+}
+
+async function loadIndexDb(): Promise<Database> {
+  const db = await openDb(twitterBookmarksIndexPath());
+  ensureMigrations(db);
+  return db;
+}
+
+// ── Static assets ─────────────────────────────────────────────────────────────
+
+const requireFromHere = createRequire(import.meta.url);
+
+/** Vendored front-end libraries, served from node_modules so the dashboard works offline. */
+const VENDOR_ASSETS: Record<string, { resolve: () => string; contentType: string }> = {
+  '/assets/chart.umd.min.js': {
+    resolve: () => path.join(path.dirname(requireFromHere.resolve('chart.js')), 'chart.umd.min.js'),
+    contentType: 'text/javascript; charset=utf-8',
+  },
+  '/assets/alpine.min.js': {
+    resolve: () => path.join(path.dirname(requireFromHere.resolve('alpinejs')), 'cdn.min.js'),
+    contentType: 'text/javascript; charset=utf-8',
+  },
+};
 
 // ── Media index ───────────────────────────────────────────────────────────────
 
@@ -54,14 +153,22 @@ async function buildMediaIndex(): Promise<MediaIndex> {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function json(res: ServerResponse, data: unknown, status = 200): void {
+// No CORS headers on purpose: the dashboard is same-origin, and allowing any
+// origin would let every website open in the browser read the local archive.
+function json(res: ServerResponse, data: unknown, status = 200, headers: Record<string, string> = {}): void {
   const body = JSON.stringify(data);
   res.writeHead(status, {
+    ...headers,
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(body),
-    'Access-Control-Allow-Origin': '*',
   });
   res.end(body);
+}
+
+/** Parse an integer query param, clamped to [min, max]; bad input uses the fallback. */
+function intParam(value: string | undefined, fallback: number, min: number, max = Number.MAX_SAFE_INTEGER): number {
+  const n = Number.parseInt(value ?? '', 10);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
 }
 
 function html(res: ServerResponse, body: string): void {
@@ -97,9 +204,9 @@ function buildHtml(): string {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Field Theory · Bookmark Observatory</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <link rel="stylesheet" href="/assets/app.css" />
+  <script src="/assets/chart.umd.min.js"></script>
+  <script defer src="/assets/alpine.min.js"></script>
   <style>
     [x-cloak] { display: none !important; }
     body { background: #0f0f14; color: #ccd0da; font-family: 'Inter', system-ui, sans-serif; }
@@ -111,7 +218,7 @@ function buildHtml(): string {
     .chart-container-sm { position: relative; height: 180px; }
   </style>
 </head>
-<body x-data="app()" x-init="init()" x-cloak>
+<body x-data="app()" x-cloak>
 
   <!-- Nav -->
   <nav class="sticky top-0 z-50 bg-[#0f0f14]/90 backdrop-blur border-b border-white/5">
@@ -515,8 +622,8 @@ function buildHtml(): string {
                   class="px-2 py-0.5 bg-teal-900/40 text-teal-300 text-xs rounded-full"
                   x-text="b.primaryDomain"></span>
                 <div class="ml-auto flex items-center gap-3 text-white/30 text-xs">
-                  <span x-show="b.likeCount > 0" x-text="'♥ ' + b.likeCount.toLocaleString()"></span>
-                  <span x-show="b.repostCount > 0" x-text="'↺ ' + b.repostCount.toLocaleString()"></span>
+                  <span x-show="b.likeCount > 0" x-text="'♥ ' + (b.likeCount ?? 0).toLocaleString()"></span>
+                  <span x-show="b.repostCount > 0" x-text="'↺ ' + (b.repostCount ?? 0).toLocaleString()"></span>
                   <span x-show="b.mediaCount > 0 && (!b.localMediaUrls || b.localMediaUrls.length === 0)" x-text="'📎 ' + b.mediaCount"></span>
                 </div>
               </div>
@@ -551,7 +658,7 @@ function buildHtml(): string {
   <!-- ── DETAIL SLIDE-OVER ──────────────────────────────────────────────────── -->
   <div x-show="detailOpen && detail"
     class="fixed inset-0 z-50 flex"
-    @keydown.escape.window="detailOpen = false">
+    @keydown.escape.window="removing.open ? closeRemoveDialog() : (detailOpen = false)">
 
     <!-- Backdrop -->
     <div class="absolute inset-0 bg-black/60" @click="detailOpen = false"></div>
@@ -628,27 +735,27 @@ function buildHtml(): string {
             <!-- Engagement -->
             <div class="grid grid-cols-3 gap-3">
               <div x-show="detail.likeCount > 0" class="bg-white/5 rounded-lg p-3 text-center">
-                <div class="text-pink-300 font-bold" x-text="detail.likeCount.toLocaleString()"></div>
+                <div class="text-pink-300 font-bold" x-text="(detail.likeCount ?? 0).toLocaleString()"></div>
                 <div class="text-white/40 text-xs">likes</div>
               </div>
               <div x-show="detail.repostCount > 0" class="bg-white/5 rounded-lg p-3 text-center">
-                <div class="text-green-300 font-bold" x-text="detail.repostCount.toLocaleString()"></div>
+                <div class="text-green-300 font-bold" x-text="(detail.repostCount ?? 0).toLocaleString()"></div>
                 <div class="text-white/40 text-xs">reposts</div>
               </div>
               <div x-show="detail.replyCount > 0" class="bg-white/5 rounded-lg p-3 text-center">
-                <div class="text-blue-300 font-bold" x-text="detail.replyCount.toLocaleString()"></div>
+                <div class="text-blue-300 font-bold" x-text="(detail.replyCount ?? 0).toLocaleString()"></div>
                 <div class="text-white/40 text-xs">replies</div>
               </div>
               <div x-show="detail.quoteCount > 0" class="bg-white/5 rounded-lg p-3 text-center">
-                <div class="text-purple-300 font-bold" x-text="detail.quoteCount.toLocaleString()"></div>
+                <div class="text-purple-300 font-bold" x-text="(detail.quoteCount ?? 0).toLocaleString()"></div>
                 <div class="text-white/40 text-xs">quotes</div>
               </div>
               <div x-show="detail.bookmarkCount > 0" class="bg-white/5 rounded-lg p-3 text-center">
-                <div class="text-amber-300 font-bold" x-text="detail.bookmarkCount.toLocaleString()"></div>
+                <div class="text-amber-300 font-bold" x-text="(detail.bookmarkCount ?? 0).toLocaleString()"></div>
                 <div class="text-white/40 text-xs">bookmarks</div>
               </div>
               <div x-show="detail.viewCount > 0" class="bg-white/5 rounded-lg p-3 text-center">
-                <div class="text-white/60 font-bold" x-text="detail.viewCount.toLocaleString()"></div>
+                <div class="text-white/60 font-bold" x-text="(detail.viewCount ?? 0).toLocaleString()"></div>
                 <div class="text-white/40 text-xs">views</div>
               </div>
             </div>
@@ -683,10 +790,14 @@ function buildHtml(): string {
               View on X ↗
             </a>
 
-            <!-- Delete bookmark -->
-            <button @click="deleteBookmark(detail.id, detail.url)"
-              class="flex items-center justify-center gap-2 w-full py-2 bg-red-900/20 hover:bg-red-900/40 rounded-lg text-sm text-red-400 hover:text-red-300 transition-colors border border-red-900/30">
-              🗑 Delete from local archive &amp; open on X to unbookmark
+            <!-- Remove bookmark: on X first, then from the local archive -->
+            <button @click="removeBookmark(detail)" :disabled="removing.busy"
+              class="flex items-center justify-center gap-2 w-full py-2 bg-red-900/20 hover:bg-red-900/40 rounded-lg text-sm text-red-400 hover:text-red-300 transition-colors border border-red-900/30 disabled:opacity-60 disabled:cursor-wait">
+              <svg x-show="removing.busy && !removing.open" class="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path>
+              </svg>
+              <span x-text="removing.busy && !removing.open ? 'Removing on X…' : '🗑 Remove bookmark on X and from archive'"></span>
             </button>
 
           </div>
@@ -694,6 +805,50 @@ function buildHtml(): string {
       </div>
     </div>
   </div>
+
+  <!-- ── REMOVE FAILED DIALOG ────────────────────────────────────────────────── -->
+  <div x-show="removing.open" x-transition.opacity
+    class="fixed inset-0 z-[60] flex items-center justify-center p-4"
+    role="dialog" aria-modal="true" aria-labelledby="remove-dialog-title">
+    <div class="absolute inset-0 bg-black/70" @click="closeRemoveDialog()"></div>
+    <div class="relative w-full max-w-md bg-[#16161f] border border-white/10 rounded-2xl shadow-2xl p-6 space-y-4">
+      <div class="flex items-start gap-3">
+        <div class="shrink-0 w-9 h-9 rounded-full bg-amber-900/40 text-amber-300 flex items-center justify-center font-bold" aria-hidden="true">!</div>
+        <div class="min-w-0">
+          <h2 id="remove-dialog-title" class="text-white font-medium">Couldn't remove it on X</h2>
+          <p class="text-white/70 text-sm mt-1 break-words" x-text="removing.error"></p>
+          <p class="text-white/40 text-xs mt-2" x-show="removeHint()" x-text="removeHint()"></p>
+        </div>
+      </div>
+
+      <p class="text-white/40 text-xs leading-relaxed">
+        It's still in your archive. If you only remove it locally while it's bookmarked on X, the next
+        <code class="text-white/60">ft sync</code> brings it back.
+      </p>
+
+      <div class="flex flex-col gap-2">
+        <button x-ref="removeRetry" @click="removeBookmark(removing.bookmark)" :disabled="removing.busy"
+          class="w-full py-2 rounded-lg text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white transition-colors disabled:opacity-60 disabled:cursor-wait focus:outline-none focus:ring-2 focus:ring-purple-400"
+          x-text="removing.busy ? 'Trying again…' : 'Try again'"></button>
+        <a :href="removing.bookmark ? removing.bookmark.url : '#'" target="_blank" rel="noopener noreferrer"
+          @click="removing.openedOnX = true"
+          class="w-full py-2 rounded-lg text-sm text-center bg-white/5 hover:bg-white/10 text-white/80 border border-white/10 transition-colors focus:outline-none focus:ring-2 focus:ring-purple-400">
+          Open on X to unbookmark it yourself ↗
+        </a>
+        <button @click="removeLocally()" :disabled="removing.busy"
+          :class="removing.openedOnX ? 'bg-red-900/40 text-red-200 border-red-800/60' : 'bg-transparent text-red-400/80 border-red-900/30'"
+          class="w-full py-2 rounded-lg text-sm border hover:bg-red-900/40 transition-colors disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-red-400"
+          x-text="removing.openedOnX ? 'Done on X — remove from archive' : 'Remove from archive only'"></button>
+        <button @click="closeRemoveDialog()"
+          class="w-full py-1.5 text-xs text-white/40 hover:text-white/70 transition-colors">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TOAST ───────────────────────────────────────────────────────────────── -->
+  <div x-show="toast.show" x-transition
+    class="fixed bottom-6 left-1/2 -translate-x-1/2 z-[70] px-4 py-2 rounded-lg bg-[#1e1e2e] border border-white/10 text-sm text-white/80 shadow-xl"
+    role="status" aria-live="polite" x-text="toast.message"></div>
 
 <script>
 const CHART_DEFAULTS = {
@@ -922,6 +1077,8 @@ function app() {
       domain:   { open: false, search: '', items: [] },
     },
     chartsBuilt: false,
+    removing: { open: false, busy: false, bookmark: null, error: '', reason: '', retryAfterSec: null, openedOnX: false },
+    toast: { show: false, message: '', timer: null },
 
     async init() {
       await this.loadOverview();
@@ -951,17 +1108,31 @@ function app() {
       buildLinkDomainsChart(d);
     },
 
-    async loadBookmarks() {
-      this.bookmarksLoading = true;
+    // keepPosition refreshes the list in place (e.g. after a removal). Swapping
+    // the list for the loading spinner collapses the page and jumps to the top.
+    async loadBookmarks({ keepPosition = false } = {}) {
+      const scrollY = window.scrollY;
+      if (!keepPosition) this.bookmarksLoading = true;
       try {
-        const params = this.buildParams();
-        const [listRes, countRes] = await Promise.all([
-          fetch('/api/bookmarks?' + params),
-          fetch('/api/count?' + params),
-        ]);
-        this.bookmarks = await listRes.json();
-        const countData = await countRes.json();
-        this.totalCount = countData.count ?? 0;
+        const res = await fetch('/api/bookmarks?' + this.buildParams());
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || res.statusText);
+        const total = Number(res.headers.get('X-Total-Count')) || 0;
+
+        // Removing the last item on a later page leaves it empty: show the new last page.
+        if (keepPosition && data.length === 0 && total > 0 && this.filters.offset > 0) {
+          this.filters.offset = Math.floor((total - 1) / this.filters.limit) * this.filters.limit;
+          return this.loadBookmarks({ keepPosition });
+        }
+
+        this.bookmarks = data;
+        this.totalCount = total;
+        if (keepPosition) {
+          this.$nextTick(() => {
+            const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+            window.scrollTo({ top: Math.min(scrollY, maxY) });
+          });
+        }
       } catch (e) {
         console.error('Failed to load bookmarks:', e);
       } finally {
@@ -1053,18 +1224,73 @@ function app() {
       }
     },
 
-    async deleteBookmark(id, tweetUrl) {
+    // Remove a bookmark on X, then from the archive. On failure the server keeps
+    // the local copy and a dialog offers retry, manual removal on X (a real link,
+    // so popup blockers never interfere), or local-only removal.
+    async removeBookmark(bookmark, scope) {
+      if (!bookmark || this.removing.busy) return;
+      this.removing.busy = true;
+      this.removing.bookmark = { id: bookmark.id, url: bookmark.url };
       try {
-        const res = await fetch('/api/bookmarks/' + encodeURIComponent(id), { method: 'DELETE' });
-        if (!res.ok) { console.error('Delete failed', await res.text()); return; }
+        const query = scope === 'local' ? '?scope=local' : '';
+        const res = await fetch('/api/bookmarks/' + encodeURIComponent(bookmark.id) + query, { method: 'DELETE' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          Object.assign(this.removing, {
+            open: true,
+            error: data.error || ('Request failed (HTTP ' + res.status + ')'),
+            reason: data.reason || '',
+            retryAfterSec: data.retryAfterSec ?? null,
+          });
+          this.$nextTick(() => this.$refs.removeRetry && this.$refs.removeRetry.focus());
+          return;
+        }
+        this.closeRemoveDialog();
+        this.detailOpen = false;
+        if (this.overview) this.overview.total = Math.max(0, this.overview.total - 1);
+        await this.loadBookmarks({ keepPosition: true });
+        this.detail = null;
+        this.showToast(
+          data.remote === 'removed' ? 'Removed from X and your archive'
+            : data.remote === 'not_bookmarked' ? 'Already gone on X — removed from your archive'
+            : 'Removed from your archive'
+        );
       } catch (e) {
-        console.error('Delete failed:', e);
-        return;
+        Object.assign(this.removing, {
+          open: true,
+          error: 'Could not reach the Field Theory server: ' + e.message,
+          reason: 'server',
+        });
+      } finally {
+        this.removing.busy = false;
       }
-      this.detailOpen = false;
-      await this.loadBookmarks();
-      this.detail = null;
-      if (tweetUrl) window.open(tweetUrl, '_blank', 'noopener,noreferrer');
+    },
+
+    removeLocally() {
+      return this.removeBookmark(this.removing.bookmark, 'local');
+    },
+
+    closeRemoveDialog() {
+      Object.assign(this.removing, { open: false, error: '', reason: '', retryAfterSec: null, openedOnX: false });
+    },
+
+    removeHint() {
+      switch (this.removing.reason) {
+        case 'auth': return 'Check that you are logged into x.com in the browser ft uses (or restart ft web with --browser / --cookies).';
+        case 'rate_limited': return this.removing.retryAfterSec
+          ? 'X asks to wait about ' + Math.max(1, Math.ceil(this.removing.retryAfterSec / 60)) + ' min before retrying.'
+          : 'Wait a minute, then try again.';
+        case 'network': return 'Check your internet connection, then try again.';
+        case 'rejected': return 'X may have changed its web API. Removing it yourself on X always works.';
+        default: return '';
+      }
+    },
+
+    showToast(message) {
+      clearTimeout(this.toast.timer);
+      this.toast.message = message;
+      this.toast.show = true;
+      this.toast.timer = setTimeout(() => { this.toast.show = false; }, 3500);
     },
   };
 }
@@ -1075,9 +1301,49 @@ function app() {
 
 // ── Request router ────────────────────────────────────────────────────────────
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaIndex: MediaIndex): Promise<void> {
+interface WebState {
+  getDb: () => Promise<Database>;
+  getMediaIndex: () => Promise<MediaIndex>;
+  unbookmark: (tweetId: string) => Promise<UnbookmarkResult>;
+}
+
+export interface WebServerOptions {
+  /** Where to read the X session from when removing bookmarks on X. */
+  xSession?: XSessionOptions;
+  /** Override the X unbookmark call (tests). Defaults to the browser-session GraphQL mutation. */
+  unbookmark?: (tweetId: string) => Promise<UnbookmarkResult>;
+}
+
+function filtersFromQuery(q: Record<string, string>) {
+  return {
+    query: q.q || undefined,
+    author: q.author || undefined,
+    category: q.category || undefined,
+    domain: q.domain || undefined,
+    after: q.after || undefined,
+    before: q.before || undefined,
+  };
+}
+
+function sendAsset(res: ServerResponse, body: string | Buffer, contentType: string): void {
+  res.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'public, max-age=3600',
+  });
+  res.end(body);
+}
+
+async function handleRequest(req: IncomingMessage, res: ServerResponse, state: WebState): Promise<void> {
   const parsed = parseUrl(req.url ?? '', true);
   const pathname = parsed.pathname ?? '/';
+
+  // Only answer requests addressed to this machine. Blocks DNS-rebinding pages
+  // from reaching the API, which can remove bookmarks on X.
+  if (!LOCAL_HOST.test(req.headers.host ?? '')) {
+    json(res, { error: 'forbidden host' }, 403);
+    return;
+  }
 
   // Static HTML shell
   if (req.method === 'GET' && pathname === '/') {
@@ -1085,20 +1351,62 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaInd
     return;
   }
 
-  // DELETE /api/bookmarks/:id
+  // Bundled CSS and vendored scripts
+  if (req.method === 'GET' && pathname === '/assets/app.css') {
+    sendAsset(res, WEB_CSS, 'text/css; charset=utf-8');
+    return;
+  }
+  const vendorAsset = req.method === 'GET' ? VENDOR_ASSETS[pathname] : undefined;
+  if (vendorAsset) {
+    sendAsset(res, await readFile(vendorAsset.resolve()), vendorAsset.contentType);
+    return;
+  }
+
+  // DELETE /api/bookmarks/:id[?scope=local]
+  //
+  // By default the bookmark is removed on X first and only then from the local
+  // archive: deleting locally while it is still bookmarked on X would just
+  // bring it back on the next `ft sync`. If X fails, the local copy is kept and
+  // the reason is returned so the dashboard can offer retry / manual removal.
+  // `scope=local` skips X (used after the user removed it on X by hand).
   if (req.method === 'DELETE') {
     const deleteMatch = pathname.match(/^\/api\/bookmarks\/(.+)$/);
     if (!deleteMatch) {
       json(res, { error: 'not found' }, 404);
       return;
     }
+    if (!isSameOrigin(req)) {
+      json(res, { error: 'cross-origin request refused' }, 403);
+      return;
+    }
     const id = decodeURIComponent(deleteMatch[1]);
+    const bookmark = await getBookmarkById(id, await state.getDb());
+    if (!bookmark) {
+      json(res, { error: 'not found' }, 404);
+      return;
+    }
+
+    let remote: UnbookmarkStatus | 'skipped' = 'skipped';
+    if (qs(req).scope !== 'local') {
+      const result = await state.unbookmark(bookmark.tweetId);
+      if (!result.ok) {
+        json(res, {
+          error: result.message,
+          reason: result.status,
+          retryAfterSec: result.retryAfterSec,
+          url: bookmark.url,
+        }, 502);
+        return;
+      }
+      remote = result.status;
+    }
+
     const deleted = await deleteBookmark(id);
     if (!deleted) {
       json(res, { error: 'not found' }, 404);
       return;
     }
-    json(res, { deleted: true, url: deleted.url });
+    json(res, { deleted: true, url: deleted.url, remote });
     return;
   }
 
@@ -1136,7 +1444,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaInd
 
   // /api/overview
   if (pathname === '/api/overview') {
-    const data = await buildVizData();
+    const data = await buildVizData(await state.getDb());
     json(res, data);
     return;
   }
@@ -1150,22 +1458,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaInd
       return;
     }
     const prefix = q.q ?? '';
-    const suggestions = await getFilterSuggestions(field, prefix);
+    const suggestions = await getFilterSuggestions(field, prefix, 20, await state.getDb());
     json(res, suggestions);
     return;
   }
 
   // /api/count
   if (pathname === '/api/count') {
-    const q = qs(req);
-    const count = await countBookmarks({
-      query: q.q || undefined,
-      author: q.author || undefined,
-      category: q.category || undefined,
-      domain: q.domain || undefined,
-      after: q.after || undefined,
-      before: q.before || undefined,
-    });
+    const count = await countBookmarks(filtersFromQuery(qs(req)), await state.getDb());
     json(res, { count });
     return;
   }
@@ -1174,36 +1474,35 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaInd
   const detailMatch = pathname.match(/^\/api\/bookmarks\/(.+)$/);
   if (detailMatch) {
     const id = decodeURIComponent(detailMatch[1]);
-    const bookmark = await getBookmarkById(id);
+    const bookmark = await getBookmarkById(id, await state.getDb());
     if (!bookmark) {
       json(res, { error: 'not found' }, 404);
       return;
     }
-    const mediaEntries = mediaIndex.get(bookmark.tweetId) ?? [];
+    const mediaEntries = (await state.getMediaIndex()).get(bookmark.tweetId) ?? [];
     const localMediaUrls = mediaEntries
       .filter((e) => !e.isProfileImage)
       .map((e) => `/media/${e.filename}`);
-    const localProfileImageUrl = mediaEntries.find((e) => e.isProfileImage)
-      ? `/media/${mediaEntries.find((e) => e.isProfileImage)!.filename}`
-      : undefined;
+    const profileImage = mediaEntries.find((e) => e.isProfileImage);
+    const localProfileImageUrl = profileImage ? `/media/${profileImage.filename}` : undefined;
     json(res, { ...bookmark, localMediaUrls, localProfileImageUrl });
     return;
   }
 
-  // /api/bookmarks
+  // /api/bookmarks — the total match count rides along in X-Total-Count so the
+  // dashboard needs one request per search instead of two.
   if (pathname === '/api/bookmarks') {
     const q = qs(req);
+    const filters = filtersFromQuery(q);
+    const db = await state.getDb();
+    const mediaIndex = await state.getMediaIndex();
     const items = await listBookmarks({
-      query: q.q || undefined,
-      author: q.author || undefined,
-      category: q.category || undefined,
-      domain: q.domain || undefined,
-      after: q.after || undefined,
-      before: q.before || undefined,
+      ...filters,
       sort: q.sort === 'asc' ? 'asc' : 'desc',
-      limit: q.limit ? Math.min(200, Math.max(1, parseInt(q.limit, 10))) : 50,
-      offset: q.offset ? Math.max(0, parseInt(q.offset, 10)) : 0,
-    });
+      limit: intParam(q.limit, 50, 1, 200),
+      offset: intParam(q.offset, 0, 0),
+    }, db);
+    const total = await countBookmarks(filters, db);
     const enriched = items.map((b) => {
       const entries = mediaIndex.get(b.tweetId) ?? [];
       const localMediaUrls = entries
@@ -1211,7 +1510,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaInd
         .map((e) => `/media/${e.filename}`);
       return { ...b, localMediaUrls };
     });
-    json(res, enriched);
+    json(res, enriched, 200, { 'X-Total-Count': String(total) });
     return;
   }
 
@@ -1220,11 +1519,21 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, mediaInd
 
 // ── Server factory (exported for testing) ────────────────────────────────────
 
-export async function createWebServer(port: number): Promise<{ port: number; close: () => Promise<void> }> {
-  const mediaIndex = await buildMediaIndex();
+export async function createWebServer(
+  port: number,
+  options: WebServerOptions = {},
+): Promise<{ port: number; close: () => Promise<void> }> {
+  const dbCache = cachedByFile(twitterBookmarksIndexPath, loadIndexDb, (db) => db.close());
+  const mediaCache = cachedByFile(bookmarkMediaManifestPath, buildMediaIndex);
+  const state: WebState = {
+    getDb: dbCache.get,
+    getMediaIndex: mediaCache.get,
+    unbookmark: options.unbookmark ?? createUnbookmarker(options.xSession),
+  };
+
   const server = createServer(async (req, res) => {
     try {
-      await handleRequest(req, res, mediaIndex);
+      await handleRequest(req, res, state);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       json(res, { error: message }, 500);
@@ -1239,15 +1548,20 @@ export async function createWebServer(port: number): Promise<{ port: number; clo
   const addr = server.address();
   const actualPort = typeof addr === 'object' && addr !== null ? addr.port : port;
   const close = (): Promise<void> =>
-    new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    new Promise((resolve, reject) => server.close((err) => {
+      dbCache.dispose();
+      mediaCache.dispose();
+      if (err) reject(err);
+      else resolve();
+    }));
 
   return { port: actualPort, close };
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-export async function startWeb(port: number, openBrowser: boolean): Promise<void> {
-  const { port: actualPort, close } = await createWebServer(port);
+export async function startWeb(port: number, openBrowser: boolean, options: WebServerOptions = {}): Promise<void> {
+  const { port: actualPort, close } = await createWebServer(port, options);
 
   const url = `http://localhost:${actualPort}`;
   process.stdout.write(`\nField Theory web running at ${url}\nPress Ctrl+C to stop.\n\n`);
