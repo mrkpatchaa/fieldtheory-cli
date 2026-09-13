@@ -1108,14 +1108,31 @@ function app() {
       buildLinkDomainsChart(d);
     },
 
-    async loadBookmarks() {
-      this.bookmarksLoading = true;
+    // keepPosition refreshes the list in place (e.g. after a removal). Swapping
+    // the list for the loading spinner collapses the page and jumps to the top.
+    async loadBookmarks({ keepPosition = false } = {}) {
+      const scrollY = window.scrollY;
+      if (!keepPosition) this.bookmarksLoading = true;
       try {
         const res = await fetch('/api/bookmarks?' + this.buildParams());
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || res.statusText);
+        const total = Number(res.headers.get('X-Total-Count')) || 0;
+
+        // Removing the last item on a later page leaves it empty: show the new last page.
+        if (keepPosition && data.length === 0 && total > 0 && this.filters.offset > 0) {
+          this.filters.offset = Math.floor((total - 1) / this.filters.limit) * this.filters.limit;
+          return this.loadBookmarks({ keepPosition });
+        }
+
         this.bookmarks = data;
-        this.totalCount = Number(res.headers.get('X-Total-Count')) || 0;
+        this.totalCount = total;
+        if (keepPosition) {
+          this.$nextTick(() => {
+            const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+            window.scrollTo({ top: Math.min(scrollY, maxY) });
+          });
+        }
       } catch (e) {
         console.error('Failed to load bookmarks:', e);
       } finally {
@@ -1231,7 +1248,7 @@ function app() {
         this.closeRemoveDialog();
         this.detailOpen = false;
         if (this.overview) this.overview.total = Math.max(0, this.overview.total - 1);
-        await this.loadBookmarks();
+        await this.loadBookmarks({ keepPosition: true });
         this.detail = null;
         this.showToast(
           data.remote === 'removed' ? 'Removed from X and your archive'
