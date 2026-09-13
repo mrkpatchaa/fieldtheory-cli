@@ -1349,9 +1349,24 @@ export function buildCli() {
     .description('Open a browser-based dashboard for your bookmarks')
     .option('--port <number>', 'Port to listen on', '4321')
     .option('--no-open', 'Do not open the browser automatically')
+    .option('--browser <name>', 'Browser to read the X session from when removing bookmarks on X (chrome, brave, firefox, ...)')
+    .option('--cookies <values...>', 'Pass ct0 and auth_token directly (skips browser extraction)')
+    .option('--chrome-user-data-dir <path>', 'Chrome-family user-data directory')
+    .option('--chrome-profile-directory <name>', 'Chrome-family profile name')
+    .option('--firefox-profile-dir <path>', 'Firefox profile directory')
     .action(safe(async (options) => {
       if (!requireIndex()) return;
-      await startWeb(parseInt(String(options.port), 10), options.open !== false);
+      const { csrfToken, cookieHeader } = parseCookieOption(options.cookies);
+      await startWeb(parseInt(String(options.port), 10), options.open !== false, {
+        xSession: {
+          browser: options.browser ? String(options.browser) : undefined,
+          chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+          chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+          firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
+          csrfToken,
+          cookieHeader,
+        },
+      });
     }));
 
   // ── classify ────────────────────────────────────────────────────────────

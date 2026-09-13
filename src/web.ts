@@ -19,6 +19,24 @@ import { pathExists, readJson } from './fs.js';
 import { bookmarkMediaDir, bookmarkMediaManifestPath, twitterBookmarksIndexPath } from './paths.js';
 import type { MediaFetchManifest } from './bookmark-media.js';
 import { WEB_CSS } from './web-styles.js';
+import { createUnbookmarker } from './x-unbookmark.js';
+import type { UnbookmarkResult, UnbookmarkStatus } from './x-unbookmark.js';
+import type { XSessionOptions } from './graphql-bookmarks.js';
+
+// ── Request origin checks ─────────────────────────────────────────────────────
+
+const LOCAL_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
+
+/** Browsers send Origin on cross-site mutations; refuse any that isn't this server. */
+function isSameOrigin(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === req.headers.host;
+  } catch {
+    return false;
+  }
+}
 
 // ── File-backed caches ────────────────────────────────────────────────────────
 
@@ -640,7 +658,7 @@ function buildHtml(): string {
   <!-- ── DETAIL SLIDE-OVER ──────────────────────────────────────────────────── -->
   <div x-show="detailOpen && detail"
     class="fixed inset-0 z-50 flex"
-    @keydown.escape.window="detailOpen = false">
+    @keydown.escape.window="removing.open ? closeRemoveDialog() : (detailOpen = false)">
 
     <!-- Backdrop -->
     <div class="absolute inset-0 bg-black/60" @click="detailOpen = false"></div>
@@ -772,10 +790,14 @@ function buildHtml(): string {
               View on X ↗
             </a>
 
-            <!-- Delete bookmark -->
-            <button @click="deleteBookmark(detail.id, detail.url)"
-              class="flex items-center justify-center gap-2 w-full py-2 bg-red-900/20 hover:bg-red-900/40 rounded-lg text-sm text-red-400 hover:text-red-300 transition-colors border border-red-900/30">
-              🗑 Delete from local archive &amp; open on X to unbookmark
+            <!-- Remove bookmark: on X first, then from the local archive -->
+            <button @click="removeBookmark(detail)" :disabled="removing.busy"
+              class="flex items-center justify-center gap-2 w-full py-2 bg-red-900/20 hover:bg-red-900/40 rounded-lg text-sm text-red-400 hover:text-red-300 transition-colors border border-red-900/30 disabled:opacity-60 disabled:cursor-wait">
+              <svg x-show="removing.busy && !removing.open" class="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path>
+              </svg>
+              <span x-text="removing.busy && !removing.open ? 'Removing on X…' : '🗑 Remove bookmark on X and from archive'"></span>
             </button>
 
           </div>
@@ -783,6 +805,50 @@ function buildHtml(): string {
       </div>
     </div>
   </div>
+
+  <!-- ── REMOVE FAILED DIALOG ────────────────────────────────────────────────── -->
+  <div x-show="removing.open" x-transition.opacity
+    class="fixed inset-0 z-[60] flex items-center justify-center p-4"
+    role="dialog" aria-modal="true" aria-labelledby="remove-dialog-title">
+    <div class="absolute inset-0 bg-black/70" @click="closeRemoveDialog()"></div>
+    <div class="relative w-full max-w-md bg-[#16161f] border border-white/10 rounded-2xl shadow-2xl p-6 space-y-4">
+      <div class="flex items-start gap-3">
+        <div class="shrink-0 w-9 h-9 rounded-full bg-amber-900/40 text-amber-300 flex items-center justify-center font-bold" aria-hidden="true">!</div>
+        <div class="min-w-0">
+          <h2 id="remove-dialog-title" class="text-white font-medium">Couldn't remove it on X</h2>
+          <p class="text-white/70 text-sm mt-1 break-words" x-text="removing.error"></p>
+          <p class="text-white/40 text-xs mt-2" x-show="removeHint()" x-text="removeHint()"></p>
+        </div>
+      </div>
+
+      <p class="text-white/40 text-xs leading-relaxed">
+        It's still in your archive. If you only remove it locally while it's bookmarked on X, the next
+        <code class="text-white/60">ft sync</code> brings it back.
+      </p>
+
+      <div class="flex flex-col gap-2">
+        <button x-ref="removeRetry" @click="removeBookmark(removing.bookmark)" :disabled="removing.busy"
+          class="w-full py-2 rounded-lg text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white transition-colors disabled:opacity-60 disabled:cursor-wait focus:outline-none focus:ring-2 focus:ring-purple-400"
+          x-text="removing.busy ? 'Trying again…' : 'Try again'"></button>
+        <a :href="removing.bookmark ? removing.bookmark.url : '#'" target="_blank" rel="noopener noreferrer"
+          @click="removing.openedOnX = true"
+          class="w-full py-2 rounded-lg text-sm text-center bg-white/5 hover:bg-white/10 text-white/80 border border-white/10 transition-colors focus:outline-none focus:ring-2 focus:ring-purple-400">
+          Open on X to unbookmark it yourself ↗
+        </a>
+        <button @click="removeLocally()" :disabled="removing.busy"
+          :class="removing.openedOnX ? 'bg-red-900/40 text-red-200 border-red-800/60' : 'bg-transparent text-red-400/80 border-red-900/30'"
+          class="w-full py-2 rounded-lg text-sm border hover:bg-red-900/40 transition-colors disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-red-400"
+          x-text="removing.openedOnX ? 'Done on X — remove from archive' : 'Remove from archive only'"></button>
+        <button @click="closeRemoveDialog()"
+          class="w-full py-1.5 text-xs text-white/40 hover:text-white/70 transition-colors">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TOAST ───────────────────────────────────────────────────────────────── -->
+  <div x-show="toast.show" x-transition
+    class="fixed bottom-6 left-1/2 -translate-x-1/2 z-[70] px-4 py-2 rounded-lg bg-[#1e1e2e] border border-white/10 text-sm text-white/80 shadow-xl"
+    role="status" aria-live="polite" x-text="toast.message"></div>
 
 <script>
 const CHART_DEFAULTS = {
@@ -1011,6 +1077,8 @@ function app() {
       domain:   { open: false, search: '', items: [] },
     },
     chartsBuilt: false,
+    removing: { open: false, busy: false, bookmark: null, error: '', reason: '', retryAfterSec: null, openedOnX: false },
+    toast: { show: false, message: '', timer: null },
 
     async init() {
       await this.loadOverview();
@@ -1139,18 +1207,73 @@ function app() {
       }
     },
 
-    async deleteBookmark(id, tweetUrl) {
+    // Remove a bookmark on X, then from the archive. On failure the server keeps
+    // the local copy and a dialog offers retry, manual removal on X (a real link,
+    // so popup blockers never interfere), or local-only removal.
+    async removeBookmark(bookmark, scope) {
+      if (!bookmark || this.removing.busy) return;
+      this.removing.busy = true;
+      this.removing.bookmark = { id: bookmark.id, url: bookmark.url };
       try {
-        const res = await fetch('/api/bookmarks/' + encodeURIComponent(id), { method: 'DELETE' });
-        if (!res.ok) { console.error('Delete failed', await res.text()); return; }
+        const query = scope === 'local' ? '?scope=local' : '';
+        const res = await fetch('/api/bookmarks/' + encodeURIComponent(bookmark.id) + query, { method: 'DELETE' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          Object.assign(this.removing, {
+            open: true,
+            error: data.error || ('Request failed (HTTP ' + res.status + ')'),
+            reason: data.reason || '',
+            retryAfterSec: data.retryAfterSec ?? null,
+          });
+          this.$nextTick(() => this.$refs.removeRetry && this.$refs.removeRetry.focus());
+          return;
+        }
+        this.closeRemoveDialog();
+        this.detailOpen = false;
+        if (this.overview) this.overview.total = Math.max(0, this.overview.total - 1);
+        await this.loadBookmarks();
+        this.detail = null;
+        this.showToast(
+          data.remote === 'removed' ? 'Removed from X and your archive'
+            : data.remote === 'not_bookmarked' ? 'Already gone on X — removed from your archive'
+            : 'Removed from your archive'
+        );
       } catch (e) {
-        console.error('Delete failed:', e);
-        return;
+        Object.assign(this.removing, {
+          open: true,
+          error: 'Could not reach the Field Theory server: ' + e.message,
+          reason: 'server',
+        });
+      } finally {
+        this.removing.busy = false;
       }
-      this.detailOpen = false;
-      await this.loadBookmarks();
-      this.detail = null;
-      if (tweetUrl) window.open(tweetUrl, '_blank', 'noopener,noreferrer');
+    },
+
+    removeLocally() {
+      return this.removeBookmark(this.removing.bookmark, 'local');
+    },
+
+    closeRemoveDialog() {
+      Object.assign(this.removing, { open: false, error: '', reason: '', retryAfterSec: null, openedOnX: false });
+    },
+
+    removeHint() {
+      switch (this.removing.reason) {
+        case 'auth': return 'Check that you are logged into x.com in the browser ft uses (or restart ft web with --browser / --cookies).';
+        case 'rate_limited': return this.removing.retryAfterSec
+          ? 'X asks to wait about ' + Math.max(1, Math.ceil(this.removing.retryAfterSec / 60)) + ' min before retrying.'
+          : 'Wait a minute, then try again.';
+        case 'network': return 'Check your internet connection, then try again.';
+        case 'rejected': return 'X may have changed its web API. Removing it yourself on X always works.';
+        default: return '';
+      }
+    },
+
+    showToast(message) {
+      clearTimeout(this.toast.timer);
+      this.toast.message = message;
+      this.toast.show = true;
+      this.toast.timer = setTimeout(() => { this.toast.show = false; }, 3500);
     },
   };
 }
@@ -1164,6 +1287,14 @@ function app() {
 interface WebState {
   getDb: () => Promise<Database>;
   getMediaIndex: () => Promise<MediaIndex>;
+  unbookmark: (tweetId: string) => Promise<UnbookmarkResult>;
+}
+
+export interface WebServerOptions {
+  /** Where to read the X session from when removing bookmarks on X. */
+  xSession?: XSessionOptions;
+  /** Override the X unbookmark call (tests). Defaults to the browser-session GraphQL mutation. */
+  unbookmark?: (tweetId: string) => Promise<UnbookmarkResult>;
 }
 
 function filtersFromQuery(q: Record<string, string>) {
@@ -1190,6 +1321,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, state: W
   const parsed = parseUrl(req.url ?? '', true);
   const pathname = parsed.pathname ?? '/';
 
+  // Only answer requests addressed to this machine. Blocks DNS-rebinding pages
+  // from reaching the API, which can remove bookmarks on X.
+  if (!LOCAL_HOST.test(req.headers.host ?? '')) {
+    json(res, { error: 'forbidden host' }, 403);
+    return;
+  }
+
   // Static HTML shell
   if (req.method === 'GET' && pathname === '/') {
     html(res, buildHtml());
@@ -1207,20 +1345,51 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, state: W
     return;
   }
 
-  // DELETE /api/bookmarks/:id
+  // DELETE /api/bookmarks/:id[?scope=local]
+  //
+  // By default the bookmark is removed on X first and only then from the local
+  // archive: deleting locally while it is still bookmarked on X would just
+  // bring it back on the next `ft sync`. If X fails, the local copy is kept and
+  // the reason is returned so the dashboard can offer retry / manual removal.
+  // `scope=local` skips X (used after the user removed it on X by hand).
   if (req.method === 'DELETE') {
     const deleteMatch = pathname.match(/^\/api\/bookmarks\/(.+)$/);
     if (!deleteMatch) {
       json(res, { error: 'not found' }, 404);
       return;
     }
+    if (!isSameOrigin(req)) {
+      json(res, { error: 'cross-origin request refused' }, 403);
+      return;
+    }
     const id = decodeURIComponent(deleteMatch[1]);
+    const bookmark = await getBookmarkById(id, await state.getDb());
+    if (!bookmark) {
+      json(res, { error: 'not found' }, 404);
+      return;
+    }
+
+    let remote: UnbookmarkStatus | 'skipped' = 'skipped';
+    if (qs(req).scope !== 'local') {
+      const result = await state.unbookmark(bookmark.tweetId);
+      if (!result.ok) {
+        json(res, {
+          error: result.message,
+          reason: result.status,
+          retryAfterSec: result.retryAfterSec,
+          url: bookmark.url,
+        }, 502);
+        return;
+      }
+      remote = result.status;
+    }
+
     const deleted = await deleteBookmark(id);
     if (!deleted) {
       json(res, { error: 'not found' }, 404);
       return;
     }
-    json(res, { deleted: true, url: deleted.url });
+    json(res, { deleted: true, url: deleted.url, remote });
     return;
   }
 
@@ -1333,10 +1502,17 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, state: W
 
 // ── Server factory (exported for testing) ────────────────────────────────────
 
-export async function createWebServer(port: number): Promise<{ port: number; close: () => Promise<void> }> {
+export async function createWebServer(
+  port: number,
+  options: WebServerOptions = {},
+): Promise<{ port: number; close: () => Promise<void> }> {
   const dbCache = cachedByFile(twitterBookmarksIndexPath, loadIndexDb, (db) => db.close());
   const mediaCache = cachedByFile(bookmarkMediaManifestPath, buildMediaIndex);
-  const state: WebState = { getDb: dbCache.get, getMediaIndex: mediaCache.get };
+  const state: WebState = {
+    getDb: dbCache.get,
+    getMediaIndex: mediaCache.get,
+    unbookmark: options.unbookmark ?? createUnbookmarker(options.xSession),
+  };
 
   const server = createServer(async (req, res) => {
     try {
@@ -1367,8 +1543,8 @@ export async function createWebServer(port: number): Promise<{ port: number; clo
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-export async function startWeb(port: number, openBrowser: boolean): Promise<void> {
-  const { port: actualPort, close } = await createWebServer(port);
+export async function startWeb(port: number, openBrowser: boolean, options: WebServerOptions = {}): Promise<void> {
+  const { port: actualPort, close } = await createWebServer(port, options);
 
   const url = `http://localhost:${actualPort}`;
   process.stdout.write(`\nField Theory web running at ${url}\nPress Ctrl+C to stop.\n\n`);
